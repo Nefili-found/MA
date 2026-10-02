@@ -113,6 +113,16 @@
 
 ---
 
+### R4 · 建立 Git 版本记录
+
+- 在仓库根 `experiment framework/` 执行 `git init -b main`。
+- 新增 `.gitignore`：排除 `.venv/`、`.idea/`、`.env`、`memory.db`、`output/*.json`、`Framework - 副本/` 等；放行 `.env.example` 与 `output/.gitkeep`。
+- 新增 `WORKFLOW.md`：提交信息规范 / 里程碑 tag / 与 `CHANGE.md` 日期联动。
+- 首个提交：`bfa055e` `chore: 初始化仓库（Framework 骨架 + 文档）`（42 文件）。
+- 本地身份：`user.name=fkh37`（`--local`），沿用全局 `user.email`；`core.autocrlf=true`、`core.quotepath=false`。
+
+---
+
 ### 附 A · 代码与文档核对差异（依据）
 
 | 核对点 | 实际代码 | 原文档描述 | 结论 |
