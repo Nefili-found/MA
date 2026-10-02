@@ -1,0 +1,38 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# ===== IDE =====
+.idea/
+*.iml
+.vscode/
+
+# ===== 密钥 / 本地配置（保留示例文件）=====
+.env
+config/.env
+*.secret
+!*.env.example
+!config/.env.example
+
+# ===== 运行产物 / 本地数据库 =====
+memory.db
+*.db
+*.sqlite
+*.sqlite3
+output/*.json
+!output/.gitkeep
+
+# ===== 系统文件 / 日志 =====
+.DS_Store
+Thumbs.db
+desktop.ini
+*.log
+
+# ===== 旧布局副本（不入库；如需纳入请删除本行）=====
+Framework - 副本/

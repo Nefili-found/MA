@@ -1,0 +1,27 @@
+# 非敏感配置示例。
+# 复制为 config/config.yaml 后按需修改；不存在时程序会回退读取本文件。
+# 敏感信息（API Key 等）请放在 config/.env，不要写在这里。
+
+llm:
+  provider: openai          # LLM 提供商（当前实现面向 OpenAI 兼容接口）
+  model: gpt-4o-mini        # TODO: 请填写你要使用的模型名
+  base_url: ""              # 兼容 OpenAI 协议的服务可填写，留空则用官方默认
+  temperature: 0.0
+
+memory:
+  db_path: memory.db        # SQLite 记忆库文件路径
+
+input:
+  file: examples/input/sample.c
+
+output:
+  path: output/final_report.json
+
+retries:
+  max: 3                    # Agent 输出格式错误时的最大重试次数
+
+logging:
+  enabled: true
+
+prompts:
+  roles_path: prompts/roles.yaml

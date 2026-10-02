@@ -1,0 +1,6 @@
+1. **加一层验证者（最高性价比，直接抄 AAMAS）**：新增第 4 个视角"Verifier"，输入=3 份报告+源码，输出 DECISION(ACCEPT/CHALLENGE/REJECT)+FINAL_VULNERABILITY+REASONING。本地小模型即可，零边际成本。预计 precision +10pp 量级。
+2. **给 assume 加验证纪律（抄 VulAgent）**：在 Behavior/Static 之后加 TriggerPlanner（assume→触发路径+前置条件）和 AssumptionPruner（逐条标 plausible/contradicted/unknown），过滤不可达假设。
+3. **CWE 字段化 + 严重性/置信度**：把 vuln_type 改成 `cwe_id` + `severity` + `confidence`，即可算层次化匹配率、可设阈值。
+4. **补 7 类语义视角或合并进 Security-CWE 清单**：至少加 FormatString / Injection / Concurrency / Auth / Crypto / ErrorHandling 视角，或学 AAMAS 在某一视角硬编码 CWE 清单覆盖。
+5. **真实 CFG/数据依赖喂入**：用 Joern/CodeQL 抽图，作为 `{code_context}` 注入，删掉"LLM 基于 CFG"的伪指令。
+6. **跨视角去重**：加 Aggregator，按 CWE+行区间合并，记录 source_agents 与 AGREEMENT_LEVEL

@@ -1,0 +1,401 @@
+代码生成提示词
+你是一名资深 Python / LangGraph 架构师。请根据以下需求，生成一个可运行的架构骨架 + 关键接口项目。不要生成完整业务逻辑；凡是需要我后续补充的地方，请用 TODO、空字符串、占位实现或注释明确标注，并同步写入 QUESTION.md。
+
+1. 项目目标
+构建一个多 Agent 代码漏洞扫描系统：
+
+A、B、C 三个扫描 Agent，从三个视角扫描同一个 C 源码文件，生成统一 JSON 格式的漏洞判断报告。
+
+A/B/C 使用并行 fan-out 图结构，但允许顺序调度。
+
+D 是汇总 Agent，必须等 A/B/C 三份报告全部输入后才启动。
+
+D 负责：
+
+用 LLM 语义相似度去重；
+调取对应报告的判断内容，裁决冲突并判断置信度；
+将原始报告、生成 Agent、工具调用、D 的假设验证推断写入记忆库；
+调用工具验证污点假设；
+输出精简后的最终 JSON 报告。
+D 必须具备调用工具的能力。
+
+最终报告用于后续修复 Agent。
+
+2. 技术栈与环境
+Python 3.11+
+
+LangGraph
+
+Linux 环境
+
+SQLite 作为记忆库
+
+LLM 提供商可配置；代码中读取环境变量，不硬编码密钥
+
+生成代码时，凡是需要 API Key 的地方，标注 TODO: 请在此处配置 API Key 或环境变量
+
+输入：单个 C 源码文件
+
+污点分析严格限制在当前文件内，不跨文件
+
+文件访问限制为指定文件，不读取其他文件
+
+安全权限、沙箱、资源限制不作考虑
+
+3. 目录结构要求
+请生成以下目录与文件：
+
+text
+project/
+  main.py
+  graph.py
+  state.py
+  agents/
+    __init__.py
+    a.py
+    b.py
+    c.py
+    d.py
+  memory/
+    __init__.py
+    db.py
+    ledger.py
+    view.py
+    retrieval.py
+  tools/
+    __init__.py
+    verify_taint.py
+  prompts/
+    roles.yaml
+  config/
+    config.example.yaml
+    .env.example
+  observability.py
+  output/
+    .gitkeep
+  examples/
+    input/
+      sample.c
+  requirements.txt
+  QUESTION.md
+  README.md
+4. LangGraph 状态设计
+在 state.py 中定义图状态，至少包含：
+
+file_path
+
+code
+
+reports: 保存 A/B/C 三份原始报告
+
+merged_findings: D 去重整合后的中间结果
+
+verified_findings: 工具验证后的结果
+
+final_report: 最终输出 JSON
+
+session_id
+
+errors
+
+5. A/B/C Agent 要求
+A、B、C 是三个独立扫描 Agent。
+
+三者输出统一 JSON 报告。
+
+报告结构固定，但报告内容字段留白，供我后续填写角色 Prompt 后生成。
+
+角色 Prompt 放在 prompts/roles.yaml，A/B/C 的 role_prompt 默认为空字符串，并注明：
+# TODO: 请填写 A/B/C 的角色 Prompt
+
+代码中提供可运行的 fallback 占位 Prompt，确保项目能完整跑通。
+
+A/B/C 统一报告 JSON Schema 骨架：
+
+json
+{
+  "agent": "A|B|C",
+  "file": "",
+  "findings": [
+    {
+      "id": "",
+      "title": "",
+      "location": {
+        "file": "",
+        "line_start": 0,
+        "line_end": 0,
+        "function": ""
+      },
+      "cwe": "",
+      "severity": "",
+      "confidence": 0.0,
+      "taint_source": "",
+      "taint_sink": "",
+      "propagation_path": [],
+      "evidence": "",
+      "suggestion": ""
+    }
+  ]
+}
+6. 图编排要求
+使用 LangGraph。
+
+保留 A/B/C 的并行 fan-out 结构，但允许顺序调度。
+
+图结构建议：
+
+START -> A
+
+START -> B
+
+START -> C
+
+A/B/C -> D 作为 join 节点
+
+D 必须检查 A/B/C 三份报告是否齐全；只有三份都输入后才启动。
+
+若未齐全，停止并报错，或等待补齐。
+
+不考虑超时、重试、单 Agent 失败的复杂策略；但格式错误时需自动修复/重试。
+
+7. D Agent 要求
+D 必须具备以下能力：
+
+等待 A/B/C 三份报告。
+
+使用 LLM 语义相似度对 findings 去重。
+
+调取对应原始报告中的判断内容和 confidence，进行冲突裁决，输出最终置信度与理由。
+
+将原始报告和生成 Agent 写入 ledger。
+
+将工具调用记录与 D 的假设验证推断写入 view。
+
+调用工具验证污点假设。
+
+写入记忆库后，再生成精简报告。
+
+D 必须绑定工具调用能力，例如使用 llm.bind_tools([verify_taint]) 或 ToolNode 循环。
+
+工具失败、超时、无结果时，停止并报错。
+
+如果无法验证，标记为 uncertain 并说明原因。
+
+8. 记忆库要求
+使用 SQLite，默认文件 memory.db。包含两张表：
+
+ledger
+记录原始报告和对应生成 Agent，至少字段：
+
+id
+
+session_id
+
+agent
+
+report_json
+
+code_hash
+
+created_at
+
+view
+记录工具调用与 D 的假设验证推断，至少字段：
+
+id
+
+session_id
+
+hypothesis_json
+
+tool_call_json
+
+tool_result_json
+
+inference_json
+
+status
+
+confidence
+
+reason
+
+created_at
+
+历史相似漏洞检索：
+
+仅在同一会话内检索；
+
+使用 LLM 语义相似度；
+
+不引入向量数据库；
+
+不保留跨会话长期记忆。
+
+9. 工具验证接口
+在 tools/verify_taint.py 中提供接口：
+
+python
+def verify_taint(hypothesis: dict, context: dict) -> dict:
+    """
+    返回:
+    {
+      "status": "verified|rejected|uncertain",
+      "confidence": 0.0,
+      "reason": "",
+      "tool_name": "",
+      "raw_output": {}
+    }
+    """
+要求：
+
+默认实现返回 uncertain，原因写“具体验证工具未配置”。
+
+具体工具留白，仅生成 Framework。
+
+D 调用该工具，并将调用记录写入 view。
+
+工具失败/超时/无结果时，停止并报错。
+
+10. 最终输出 JSON
+路径：output/final_report.json
+
+结构：
+
+json
+{
+  "file": "",
+  "findings": [
+    {
+      "location": {
+        "file": "",
+        "line_start": 0,
+        "line_end": 0,
+        "function": ""
+      },
+      "taint_chain": [],
+      "verification_status": "verified|rejected|uncertain",
+      "confidence": 0.0,
+      "fix_suggestion": ""
+    }
+  ]
+}
+不输出 Markdown、SARIF、可读摘要。
+
+该 JSON 用于后续修复 Agent。
+
+11. 配置与留白
+生成以下文件，并按方案一处理环境配置：
+
+requirements.txt
+仅包含 Python 依赖包及版本。
+
+顶部可加简短注释，例如：
+
+txt
+# Python 3.11+
+# 运行前请复制 config/.env.example 为 config/.env，并填写必要环境变量。
+# 完整运行环境配置见 README.md。
+不把 API Key、环境变量、系统依赖写进 requirements.txt。
+
+README.md
+必须包含完整“运行环境配置”章节：
+
+Python 3.11+
+
+Linux 环境
+
+安装依赖命令
+
+如何复制 config/.env.example 为 config/.env
+
+需要配置哪些环境变量
+
+config/config.example.yaml 的作用
+
+SQLite 数据库路径
+
+运行命令：python main.py --file examples/input/sample.c
+
+输出路径：output/final_report.json
+
+config/.env.example
+列出所有环境变量占位，例如：
+
+OPENAI_API_KEY=
+
+MODEL_NAME=
+
+LLM_PROVIDER=
+
+其他需要我后续补充的环境变量
+
+不写真实密钥。
+
+config/config.example.yaml
+非敏感配置示例：
+
+模型名
+
+LLM 提供商
+
+SQLite 路径
+
+输入文件路径
+
+输出路径
+
+重试次数
+
+日志开关
+
+prompts/roles.yaml
+A/B/C 的 role_prompt 为空字符串，并标注：
+# TODO: 请填写 A/B/C 的角色 Prompt
+
+QUESTION.md
+集中记录所有留白、疑问、需要我后续补充的内容，包括：
+
+A/B/C 角色 Prompt
+
+具体验证工具
+
+API Key 配置位置
+
+报告内容字段
+
+其他未明确项
+
+环境变量与配置项待补充说明
+
+12. 可观测性
+单独文件 observability.py。
+
+提供 log_event()、track_time()、count_tokens() 等空实现或简单实现。
+
+需要时调用，不强制全局启用。
+
+13. 错误处理
+Agent 输出格式错误时，自动修复/重试。
+
+工具调用失败、超时、无结果时，停止并报错。
+
+重试次数写入配置。
+
+14. 示例与验收
+示例输入：examples/input/sample.c，可放占位 C 代码。
+
+运行命令：python main.py --file examples/input/sample.c
+
+验收标准：我提供一组示例数据集后，项目能够完整跑通即可，不校验漏洞判断是否正确。
+
+15. 代码生成要求
+生成可运行的架构骨架 + 关键接口。
+
+代码中所有需要我自行补充的地方，必须显式标注 TODO。
+
+生成 requirements.txt、README.md、配置示例。
+
+不要生成完整漏洞判断逻辑、具体角色 Prompt、具体验证工具实现。
+
+保证项目结构清晰，接口稳定，便于我后续替换 Prompt 和工具。
