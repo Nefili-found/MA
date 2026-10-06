@@ -59,7 +59,7 @@ def verify_taint(hypothesis: dict, context: dict) -> dict:
 try:  # pragma: no cover - 依赖存在时才会执行
     from langchain_core.tools import tool as _lc_tool  # type: ignore
 
-    @_lc_tool
+    @_lc_tool("verify_taint")
     def verify_taint_tool(hypothesis: dict, context: dict) -> dict:
         """验证污点假设，返回 verify_taint 的字典结果。"""
         return verify_taint(hypothesis, context)
