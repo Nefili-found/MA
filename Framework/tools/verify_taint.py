@@ -41,7 +41,7 @@ def verify_taint(hypothesis: dict, context: dict) -> dict:
           "raw_output": {}
         }
     """
-    # -------- 默认占位实现：交由你后续补充真实工具 --------
+    # -------- 默认占位实现：交由后续补充真实工具 --------
     # TODO: 在这里调用真实的污点验证工具，并根据其结果填充 status / confidence / reason。
     return {
         "status": "uncertain",
