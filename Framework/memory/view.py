@@ -13,7 +13,14 @@ def _now() -> str:
 
 
 def _dumps(obj: Any) -> str:
-    return json.dumps(obj if obj is not None else {}, ensure_ascii=False)
+    try:
+        return json.dumps(obj if obj is not None else {}, ensure_ascii=False)
+    except (TypeError, ValueError):
+        # 非可序列化 / 循环引用时兜底，避免拖垮主流程
+        try:
+            return json.dumps({"error": "unserializable", "repr": repr(obj)[:2000]}, ensure_ascii=False)
+        except Exception:
+            return "{}"
 
 
 def write_verification(
