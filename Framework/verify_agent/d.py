@@ -26,6 +26,13 @@ from memory.ledger import write_report
 from memory.retrieval import find_similar_findings
 from memory.view import write_verification
 from observability import log_event, track_time
+from tools.call_context import (
+    CONTEXT_TOOLS,
+    get_callees,
+    get_callers,
+    get_function_body,
+    set_active_context,
+)
 from tools.verify_taint import verify_taint, verify_taint_tool
 
 REQUIRED_AGENTS = ("A", "B", "C")
@@ -64,7 +71,15 @@ PROMPT_ADJUDICATE = (
     '只输出 JSON：{"final_confidence": 0.0, "reason": ""}，不要输出其他内容。'
 )
 
-PROMPT_TOOL = "你可以调用 verify_taint 工具来验证污点假设。请先调用该工具。"
+PROMPT_TOOL = (
+    "你有以下工具可用：\n"
+    "* get_callers(function_name)：返回该函数在文件内的调用者（追踪污点参数来源）；\n"
+    "* get_callees(function_name)：返回该函数调用的其他函数（追踪 sink / 指针使用 / 资源释放）；\n"
+    "* get_function_body(function_name)：返回该函数的签名与实现（确认跨过程依赖）；\n"
+    "* verify_taint(hypothesis, context)：对污点假设给出 verified/rejected/uncertain 结论。\n"
+    "请先按需调用上下文工具（get_callers/get_callees/get_function_body）补充跨过程证据，"
+    "再调用 verify_taint 给出最终结论。"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +326,9 @@ def _verify_findings(
     code = state.get("code", "")
     verified: List[Dict[str, Any]] = []
 
+    # 预提取当前文件的调用图上下文，供本轮的上下文工具按需查询
+    set_active_context(code)
+
     for f in merged:
         hypothesis = _build_hypothesis(f, code)
         loc = f.get("location") or {}
@@ -383,12 +401,12 @@ def _invoke_verify(
 ):
     """调用验证工具。
 
-    * 有 LLM 且工具被成功包装为 LangChain Tool 时：走 llm.bind_tools([verify_taint]) + 工具循环；
+    * 有 LLM 且存在可绑定工具时：走 llm.bind_tools([verify_taint, ...上下文工具]) + 多轮工具循环；
     * 否则：直接调用 verify_taint。
 
     工具异常一律转换为 RuntimeError（停止并报错）。
     """
-    if llm is not None and verify_taint_tool is not None:
+    if llm is not None and _available_tools():
         try:
             return _tool_loop(llm, hypothesis, context, settings)
         except RuntimeError:
@@ -404,12 +422,64 @@ def _invoke_verify(
     return tool_call, result
 
 
+def _available_tools() -> List[Any]:
+    """可绑定的工具集合：verify_taint + 上下文工具（缺失的自动跳过）。"""
+    tools: List[Any] = []
+    if verify_taint_tool is not None:
+        tools.append(verify_taint_tool)
+    tools.extend(t for t in CONTEXT_TOOLS if t is not None)
+    return tools
+
+
+def _dispatch_tool(
+    name: Optional[str],
+    args: Dict[str, Any],
+    hypothesis: Dict[str, Any],
+    context: Dict[str, Any],
+) -> Any:
+    """按工具名分发，返回 ``(result, call_record)``。
+
+    * verify_taint：失败按原策略抛出（由上层转 RuntimeError 停止并报错）；
+    * 上下文工具：内部已降级，额外再兜一层 try/except，绝不中断主流程。
+    """
+    args = args or {}
+    # 兼容 LangChain 暴露的 *_tool 命名（verify_taint_tool / get_callers_tool 等）
+    if name and name.endswith("_tool"):
+        name = name[: -len("_tool")]
+    if name == "verify_taint":
+        h = args.get("hypothesis", hypothesis)
+        c = args.get("context", context)
+        result = verify_taint(h, c)
+        # 只记紧凑标识：完整 hypothesis/context 已分别落 hypothesis_json，避免冗余与循环引用
+        finding_id = h.get("finding_id", "") if isinstance(h, dict) else ""
+        return result, {"tool": "verify_taint", "args": {"finding_id": finding_id}}
+
+    if name in ("get_callers", "get_callees", "get_function_body"):
+        impl = {
+            "get_callers": get_callers,
+            "get_callees": get_callees,
+            "get_function_body": get_function_body,
+        }[name]
+        try:
+            result = impl(args.get("function_name", ""))
+        except Exception as exc:  # 上下文工具绝不中断主流程
+            result = {"error": f"{type(exc).__name__}: {exc}"}
+        return result, {"tool": name, "args": {"function_name": args.get("function_name", "")}}
+
+    return {"error": f"unknown tool: {name}"}, {"tool": name, "error": "unknown tool"}
+
+
 def _tool_loop(
     llm: Any, hypothesis: Dict[str, Any], context: Dict[str, Any], settings: Any
 ):
+    """模型自主多轮工具循环（MAVUL 式）。
+
+    契约：**每个 tool_call 都必须追加一条匹配 tool_call_id 的 ToolMessage**，
+    否则下一次 invoke 会因缺少匹配输出而报 400（见 record_to_finish 2026-10-03_04）。
+    """
     from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
-    bound = llm.bind_tools([verify_taint_tool])
+    bound = llm.bind_tools(_available_tools())
     messages = [
         SystemMessage(content=PROMPT_TOOL),
         HumanMessage(
@@ -417,6 +487,7 @@ def _tool_loop(
         ),
     ]
 
+    trace: List[Dict[str, Any]] = []
     last_call: Optional[Dict[str, Any]] = None
     last_result: Optional[Dict[str, Any]] = None
     for _ in range(max(1, settings.max_retries) + 2):
@@ -426,25 +497,35 @@ def _tool_loop(
             break
         messages.append(resp)
         for tc in tool_calls:
-            if tc.get("name") != "verify_taint":
-                continue
+            name = tc.get("name")
             args = tc.get("args", {}) or {}
-            h = args.get("hypothesis", hypothesis)
-            c = args.get("context", context)
-            last_result = verify_taint(h, c)
-            last_call = {"tool": "verify_taint", "args": {"hypothesis": h, "context": c}}
+            result, call_record = _dispatch_tool(name, args, hypothesis, context)
+            trace.append(call_record)
+            if name == "verify_taint":
+                last_result = result
+                last_call = call_record
             messages.append(
                 ToolMessage(
-                    content=json.dumps(last_result, ensure_ascii=False),
+                    content=json.dumps(result, ensure_ascii=False),
                     tool_call_id=tc.get("id", ""),
                 )
             )
 
     if last_result is None:
-        # 模型没有调用工具 -> 直接兜底调用
-        last_result = verify_taint(hypothesis, context)
-        last_call = {"tool": "verify_taint", "args": {"hypothesis": hypothesis, "context": context}}
-    return last_call, last_result
+        # 模型没有给出 verify_taint 结论 -> 直接兜底调用
+        last_result, last_call = _dispatch_tool(
+            "verify_taint",
+            {"hypothesis": hypothesis, "context": context},
+            hypothesis,
+            context,
+        )
+    if last_call is None:  # pragma: no cover - 防御
+        last_call = {"tool": "verify_taint", "args": {}}
+    # 用副本承载 trace：last_call 与 trace 中的同一条记录是同一个对象，
+    # 直接 setdefault 会互指形成循环引用（json 落库时报 Circular reference）。
+    summary = dict(last_call)
+    summary["trace"] = trace
+    return summary, last_result
 
 
 # ---------------------------------------------------------------------------
