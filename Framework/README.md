@@ -1,6 +1,6 @@
 # 多 Agent 代码漏洞扫描系统（框架骨架）
 
-A/B/C 三个扫描 Agent 从三个视角并行扫描同一个 C 源码文件，各自生成统一 JSON
+A/B/C 三个扫描 Agent 从三个视角并行扫描同一个 C / C++ 源码文件，各自生成统一 JSON
 漏洞报告；D 汇总 Agent 等三份报告齐全后，对结果做 LLM 语义去重、冲突裁决、
 工具验证，并写入 SQLite 记忆库，最后输出精简 JSON 报告，供后续修复 Agent 使用。
 
@@ -41,7 +41,7 @@ project/
   output/
     .gitkeep                  # 最终报告输出目录
   examples/
-    input/sample.c            # 占位示例输入
+    input/sample.c            # 示例输入（C / C++ 源码）
   requirements.txt
   README.md
   QUESTION.md
@@ -126,7 +126,7 @@ SQLite 路径、输入文件路径、输出路径、重试次数、日志开关�
 python main.py --file examples/input/sample.c
 ```
 
-- **输入**：单个 C 源码文件（仅读取该文件，不读取其他文件）
+- **输入**：单个 C / C++ 源码文件（仅读取该文件，不读取其他文件）
 - **输出**：`output/final_report.json`
 
 未配置 `OPENAI_API_KEY` 时，系统进入**降级模式**：A/B/C 返回空报告骨架，
