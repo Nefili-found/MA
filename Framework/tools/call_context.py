@@ -1,6 +1,6 @@
-"""单文件调用上下文工具（tree-sitter-c 实现）。
+"""单文件调用上下文工具（tree-sitter-cpp 实现，兼容 C 与 C++）。
 
-为 D（verifier）提供跨过程证据：给定单份 C 源码，预提取「函数索引 + 调用点边」，
+为 D（verifier）提供跨过程证据：给定单份 C / C++ 源码，预提取「函数索引 + 调用点边」，
 并导出 MAVUL 式三件套工具：
 
 * ``get_callers``       —— 谁调用了该函数（追踪污点参数来源 / 入口校验）
@@ -20,7 +20,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 from tree_sitter import Language, Parser
 
-import tree_sitter_c
+import tree_sitter_cpp
 
 TOOL_NAMES: Tuple[str, ...] = ("get_callers", "get_callees", "get_function_body")
 
@@ -30,7 +30,7 @@ TOOL_NAMES: Tuple[str, ...] = ("get_callers", "get_callees", "get_function_body"
 # ---------------------------------------------------------------------------
 def _load_language() -> Optional["Language"]:
     try:
-        return Language(tree_sitter_c.language())
+        return Language(tree_sitter_cpp.language())
     except Exception:  # pragma: no cover - 依赖/版本异常
         return None
 
@@ -65,25 +65,63 @@ def _first_identifier(node: Any) -> Optional[str]:
     return None
 
 
+def _declarator_name(node: Any) -> Optional[str]:
+    """解析声明符链，返回函数名（保留 C++ 的限定名，如 ``A::B::f``）。"""
+    cur = node
+    for _ in range(32):  # 防御性上限，避免异常 AST 死循环
+        if cur is None:
+            break
+        if cur.type in (
+            "identifier",
+            "field_identifier",
+            "qualified_identifier",
+            "destructor_name",
+            "operator_name",
+        ):
+            return _node_text(cur)
+        nxt = cur.child_by_field_name("declarator")
+        if nxt is None:
+            break
+        cur = nxt
+    return _first_identifier(node)
+
+
 def _func_name(func_node: Any) -> Optional[str]:
-    """从 function_definition 取函数名（声明符链里第一个 identifier）。"""
+    """从 function_definition 取函数名。
+
+    兼容 C 的 ``identifier`` 与 C++ 的 ``qualified_identifier``（如
+    ``CellularNetwork::Clear``）及类内 ``field_identifier``。
+    """
     decl = func_node.child_by_field_name("declarator")
     if decl is None:
         return None
-    return _first_identifier(decl)
+    name_node = (
+        decl.child_by_field_name("declarator")
+        if decl.type == "function_declarator"
+        else decl
+    )
+    if name_node is None:
+        name_node = decl
+    return _declarator_name(name_node)
 
 
 def _callee_name(call_node: Any) -> Optional[str]:
-    """从 call_expression 取被调函数名（支持 identifier 与 obj.field 形式）。"""
+    """从 call_expression 取被调函数名（C / C++ 的常见调用形式）。"""
     fn = call_node.child_by_field_name("function")
     if fn is None:
         return None
     if fn.type == "identifier":
         return _node_text(fn)
-    if fn.type == "field_expression":
+    if fn.type == "field_expression":  # obj.method / ptr->method
         field = fn.child_by_field_name("field")
         if field is not None:
             return _node_text(field)
+    if fn.type == "qualified_identifier":  # Class::static_method
+        return _node_text(fn)
+    if fn.type == "template_function":  # foo<T>(...)
+        name = fn.child_by_field_name("name")
+        if name is not None:
+            return _node_text(name)
     # 函数指针调用 / 复杂表达式 -> 未知
     return None
 
@@ -104,22 +142,44 @@ class CallContext:
         # edges: (caller, callee, call_line)
         self.edges = edges
 
-    def callers(self, function_name: str) -> Dict[str, Any]:
+    def _canonical(self, function_name: str) -> str:
+        """把查询名归一为索引键：去参数列表 + 用简单名补全为限定名。
+
+        模型常传完整签名（如 ``CellularNetwork::CellularNetwork(const ServiceInfo*)``），
+        这里先截掉参数列表，再按简单名匹配限定名（``Clear`` → ``CellularNetwork::Clear``）。
+        """
         name = (function_name or "").strip()
+        if "(" in name:
+            name = name.split("(", 1)[0].strip()
+        if name in self.functions:
+            return name
+        short = name.split("::")[-1]
+        for key in self.functions:
+            if key.split("::")[-1] == short:
+                return key
+        return name
+
+    def callers(self, function_name: str) -> Dict[str, Any]:
+        raw = (function_name or "").strip()
+        name = self._canonical(raw)
+        short = name.split("::")[-1]
         hits = [
             {"caller": caller, "call_line": line}
             for (caller, callee, line) in self.edges
-            if callee == name
+            if callee == name or callee.split("::")[-1] == short
         ]
         return {
-            "function": name,
+            "function": raw,
+            "resolved": name,
             "found": name in self.functions,
             "callers": hits,
             "count": len(hits),
         }
 
     def callees(self, function_name: str) -> Dict[str, Any]:
-        name = (function_name or "").strip()
+        raw = (function_name or "").strip()
+        name = self._canonical(raw)
+        short = name.split("::")[-1]
         hits = [
             {
                 "callee": callee,
@@ -127,25 +187,27 @@ class CallContext:
                 "defined_in_file": callee in self.functions,
             }
             for (caller, callee, line) in self.edges
-            if caller == name
+            if caller == name or caller.split("::")[-1] == short
         ]
         return {
-            "function": name,
+            "function": raw,
+            "resolved": name,
             "found": name in self.functions,
             "callees": hits,
             "count": len(hits),
         }
 
     def function_body(self, function_name: str) -> Dict[str, Any]:
-        name = (function_name or "").strip()
+        raw = (function_name or "").strip()
+        name = self._canonical(raw)
         info = self.functions.get(name)
         if info is None:
-            return {"function": name, "found": False}
-        return {"function": name, "found": True, **info}
+            return {"function": raw, "found": False}
+        return {"function": raw, "resolved": name, "found": True, **info}
 
 
 def build_context(code: str) -> CallContext:
-    """解析单份 C 源码，构建 ``CallContext``（失败降级为空上下文）。"""
+    """解析单份 C / C++ 源码，构建 ``CallContext``（失败降级为空上下文）。"""
     functions: Dict[str, Dict[str, Any]] = {}
     edges: List[Tuple[str, str, int]] = []
 
