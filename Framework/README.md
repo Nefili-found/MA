@@ -6,7 +6,7 @@ A/B/C 三个扫描 Agent 从三个视角并行扫描同一个 C 源码文件，�
 
 > 本仓库是**可运行的架构骨架 + 关键接口**。所有需要你补充的地方都以
 > `TODO` 显式标注，并集中记录在 [QUESTION.md](QUESTION.md)。
-> 未包含完整的漏洞判断逻辑、具体角色 Prompt、具体验证工具实现。
+> 未包含完整的漏洞判断逻辑、具体验证工具实现（角色 Prompt 已填写）。
 
 ---
 
@@ -30,8 +30,9 @@ project/
     retrieval.py              # 会话内历史相似漏洞检索
   tools/
     verify_taint.py           # 污点验证工具接口（默认 uncertain，留白）
+    call_context.py           # 单文件调用上下文工具（tree-sitter-cpp：callers / callees / body）
   prompts/
-    roles.yaml                # A/B/C 角色 Prompt（默认空，使用内置占位）
+    roles.yaml                # A/B/C 角色 Prompt（已填写；留空时用内置占位）
   config/
     __init__.py               # 配置加载（补充文件，见 QUESTION.md）
     config.example.yaml       # 非敏感配置示例
@@ -184,7 +185,6 @@ START ──┼─> B ─┼─> D ─> END
 
 见 [QUESTION.md](QUESTION.md)。主要包括：
 
-- A/B/C 角色 Prompt（`prompts/roles.yaml`）
 - 具体污点验证工具实现（`tools/verify_taint.py`）
 - API Key / 环境变量填写（`config/.env`）
 - 报告内容字段的生成逻辑
