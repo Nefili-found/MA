@@ -74,6 +74,8 @@ pip install -r requirements.txt
 | langchain-openai | >=1.0,<2.0 |
 | pyyaml | >=6.0 |
 | python-dotenv | >=1.0 |
+| tree-sitter | >=0.22 |
+| tree-sitter-cpp | >=0.22 |
 
 > 版本为生成时的最低可用范围；若你的环境对 LangGraph / LangChain 版本有要求，
 > 可在 `requirements.txt` 中改为精确固定版本。
