@@ -78,29 +78,43 @@ Framework/
   来源为 `prompt and report/our prompt.txt`（A / B / C 按序写入）。
 - **fallback 机制仍保留**：某 `role_prompt` 为空串时，使用
   `agents/__init__.py` 的 `_FALLBACK_ROLE_PROMPT` 占位，保证可跑通。
-- **已决定的取舍**：`our prompt.txt` 中每个角色原本还附有一段
+- **已决定的取舍（已更新）**：`our prompt.txt` 中每个角色原本还附有一段
   `【输出格式】` JSON 骨架（`agent_type` / `vulnerability_report` / `assume`）；
-  当前 `roles.yaml` **只写入 Role/Input/Tasks/Constraints，未写入 `【输出格式】` 段**，
-  输出结构改由框架在运行时追加（`agents/*.py` 的 `FINDING_TEMPLATE` schema）。
-  若要以 Prompt 内嵌的 `【输出格式】` 为准，需把该段补回 `roles.yaml`。
+  当前 `roles.yaml` **不引入外层包装**（否则与 `REPORT_TEMPLATE` 的
+  `agent`/`file`/`findings` 冲突），改为：
+  1) 各角色新增 `【Report fields】` 段，把 `assume` 的语义映射到 `assumptions` 字段；
+  2) 输出结构仍由框架运行时追加（`FINDING_TEMPLATE` schema）；
+  3) `agents/__init__.py::_FIELD_RULES` 补枚举/路径写法等文字约束。
+  原因：旧版 Prompt 要 `assume`、模板却没这个字段，`normalize_report` 按模板键白名单
+  过滤，模型写对了也会被静默丢弃（实测确认）。
+- **已解决**：A/B/C 是否需要在 Prompt 中强制“只输出 JSON” → 仍由框架末尾的
+  `build_schema_hint`（含“严格只输出一个 JSON 对象”）统一约束，不在角色 Prompt 里重复。
 - **待确认**：
-  - A/B/C 是否需要在 Prompt 中强制“只输出 JSON”？（当前由框架追加 schema 约束。）
-  - 三者的视角差异如何界定（分类维度 / 覆盖范围）？
+  - 三者的视角差异如何界定（分类维度 / 覆盖范围）？当前仅用
+    “各自侧重的 assumptions.kind”作了轻量分工（A→sanitizer、B→null_check/other、C→bounds_check）。
 
 ### 2.2 `agents/a.py` / `agents/b.py` / `agents/c.py` —— 报告模板
 
 - **位置**：各文件内的 `REPORT_TEMPLATE` 与 `FINDING_TEMPLATE`。
-- **状态**：全部**内容字段留白**：
+- **状态**：**字段已定（含 assumptions）**：
   `id / title / location{file,line_start,line_end,function} / cwe / severity /
-  confidence / taint_source / taint_sink / propagation_path / evidence / suggestion`。
-  三个文件当前结构相同，仅 `AGENT_NAME` 与视角不同（A Static / B Behavior / C Memory Layout）。
+  confidence / taint_source / taint_sink / propagation_path` /
+  **`assumptions[{id,kind,text}]`** / `evidence / suggestion`。
+  三个文件结构相同，仅 `AGENT_NAME`、注释里“本视角偏重的 kind”不同
+  （A Static、B Behavior、C Memory Layout）。
+- **已解决（字段错位）**：旧版 Prompt 要求 `assume`、`FINDING_TEMPLATE` 却没有承接字段，
+  `normalize_report` 会把它当未知字段丢弃；现新增 `assumptions`（`assume`/`conditions`
+  仍作为可识别别名，见 `verify_agent/d.py::_norm_assumptions`）。
+  模板里给一条 `text` 为空的占位元素，只用于让 schema 提示展示元素形状，
+  归一阶段会因 `text` 为空而被滤掉。
+- **已解决（取值规范）**：`assumptions[].kind` ∈
+  {`null_check`,`bounds_check`,`sanitizer`,`other`}；`severity` ∈
+  {critical,high,medium,low}；`confidence` ∈ [0,1]；`id` = `<视角>-<序号>`。
+  这些约束写在 `agents/__init__.py::_FIELD_RULES`（运行时提示）与 `roles.yaml`
+  （角色 Prompt）两处，`propagation_path` 要求写本文件内的函数名。
 - **待补充**：由角色 Prompt 生成具体内容；框架只负责结构与规范化。
-- **结构对齐提示**：`our prompt.txt` 的 `【输出格式】` 骨架
-  （`agent_type` / `vulnerability_report` / `assume`）与 `FINDING_TEMPLATE`
-  字段并不一致，需明确以哪套为准（见 2.1）。
-- **待确认**：
-  - `severity` / `confidence` 的取值规范（枚举？区间？）。
-  - `id` 的生成规则（是否需要跨 Agent 可对齐以辅助去重）。
+- **待确认**：跨视角合并后 `assumptions` 的 `id` 统一重编为 `cond-N`
+  （`_deduplicate` 里做），是否需要在报告里追溯原始视角（当前靠 `_contributions`）。
 
 ### 2.3 `agents/__init__.py` —— 共享机制
 
@@ -120,9 +134,13 @@ Framework/
 
 ### 3.1 输出报告结构
 
-- **位置**：`FINAL_REPORT_TEMPLATE`（文件内已标 `# TODO: 输出报告结构待修改`）。
+- **位置**：`FINAL_REPORT_TEMPLATE`（结构已定，不再带 TODO）。
 - **结构**：`{file, findings:[{location{file,line_start,line_end,function},
-  taint_chain[], verification_status, confidence, fix_suggestion}]}`。
+  taint_chain[], verification_status, verdict, confidence, fix_suggestion,
+  evidence{path_status, path[], conditions[], blockers[], used_tools[]}}]}`。
+- **已定（核验证据进报告）**：`verdict` 与 `evidence` 已进 `output/final_report.json`
+  （原先只进 `view` 表）。理由：修复 Agent 需要知道“为什么判成立/被推翻”，
+  而不只是一个 `verification_status`。`evidence` 缺失时输出完整空结构，不输出 `null`。
 - **待确认**：`taint_chain` 语义（完整传播路径 vs. 关键节点）；`fix_suggestion` 来源。
 
 ### 3.2 去重 / 裁决（`_deduplicate` / `_adjudicate`）

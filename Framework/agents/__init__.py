@@ -6,6 +6,25 @@
 * 未配置可用 LLM（无有效 API Key）时，扫描节点返回“空报告骨架”，
   保证整条流水线在没有密钥的情况下依然能完整跑通。
 * A/B/C 角色 Prompt 默认留空 —— 空时使用内置 fallback 占位 Prompt。
+
+================================================================================
+【优化点 O-8】扫描节点接入 A 篇上下文治理（计量 + 大输入外存）。
+--------------------------------------------------------------------------------
+对应 B 篇原文件：agents/__init__.py（本文件优化前的版本）
+原问题：
+    * ``_scan_with_llm`` 把整份 C 源码直接拼进 HumanMessage，调用前不做任何
+      计量；文件过大时只能被模型服务拒绝（context overflow），且没有可读提示。
+    * 格式错误重试时不断追加纠正消息，也没有任何预算控制。
+本文件的优化：
+    * 扫描前用 TokenMeter 计量 system + 源码的压力；
+    * 大源码在写入消息前经 ContextManager.spill_text 外存（A 篇 spill）：
+      完整源码落盘，模型只见首尾 + 文件位置，并明确提示本次覆盖范围；
+    * 每次 invoke（含格式修复重试）前调用 enforce_budget 统一治理；
+    * 降级模式（无 LLM）行为不变，仍返回空报告骨架。
+  说明：首轮是单轮扫描、无历史可压缩，超大源码无法靠压缩解决；spill 会使
+  中段代码不进入本次扫描（覆盖率下降，根治需“分块扫描”，已在优化说明中列为
+  后续项）。小文件（默认 <4096 字节）完全不受影响，依旧完整发送。
+================================================================================
 """
 from __future__ import annotations
 
@@ -14,6 +33,7 @@ import re
 from typing import Any, Dict, Optional
 
 from config import Settings, load_settings, resolve
+from context import ContextManager, content_to_text
 from observability import log_event, track_time
 
 # ---------------------------------------------------------------------------
@@ -34,6 +54,22 @@ def _report_array_key(report_template: Dict[str, Any]) -> str:
     raise ValueError("report_template 未包含数组字段（如 findings）")
 
 
+# 字段级约束：json.dumps 只能表达结构，表达不了「枚举 / 写法约定」，
+# 这里补一段文字规则。缺了它，模型会自由发挥 assumptions 的 kind、把路径写成
+# 表达式，导致下游 verify_taint 只能判「无法核」。
+_FIELD_RULES = (
+    "\n字段约定（必须遵守）：\n"
+    '* propagation_path：按 source→sink 顺序书写**本文件内的函数名**'
+    '（如 ["main","handle","strcpy"]）；无法落到函数名时写表达式原文，'
+    "下游会把该跳标记为“无法核”。\n"
+    "* assumptions[].kind：只能是 null_check / bounds_check / sanitizer / other。\n"
+    "* assumptions[].id：cond-1、cond-2 递增；assumptions[].text：一句话写成可核验的前置条件"
+    "（写清“哪个变量/缓冲区、缺什么校验”）。无前置条件时给空数组 []，不要编造。\n"
+    "* severity：critical / high / medium / low 之一；confidence：0~1 的小数。\n"
+    "* id：<视角>-<序号>（A-1 / B-1 / C-1），同一视角内唯一。\n"
+)
+
+
 def build_schema_hint(
     report_template: Dict[str, Any], finding_template: Dict[str, Any]
 ) -> str:
@@ -44,6 +80,7 @@ def build_schema_hint(
         + json.dumps(report_template, ensure_ascii=False, indent=2)
         + f"\n其中 {array_key} 数组每一项结构：\n"
         + json.dumps(finding_template, ensure_ascii=False, indent=2)
+        + _FIELD_RULES
     )
 
 # 内置 fallback 占位 Prompt（当 prompts/roles.yaml 中 role_prompt 为空时使用）
@@ -128,6 +165,18 @@ def role_prompt_for(agent: str, settings: Optional[Settings] = None) -> str:
 # ---------------------------------------------------------------------------
 # JSON 解析 / 报告规范化
 # ---------------------------------------------------------------------------
+def response_text(response: Any) -> str:
+    """取模型回复正文，并归一为字符串。
+
+    部分提供商（含本仓库使用的 OpenAI 兼容代理）对 gpt-5.x / 推理模型返回
+    content-block 列表而非 str，直接解析会崩；统一在此归一。
+    """
+    content = getattr(response, "content", None)
+    if content is None:
+        return str(response)
+    return content_to_text(content)
+
+
 def parse_json_object(text: str) -> Dict[str, Any]:
     """从模型输出中提取第一个 JSON 对象，容忍 ```json 包裹与前后噪声。"""
     if not text:
@@ -194,6 +243,22 @@ def empty_report(
 # ---------------------------------------------------------------------------
 # 扫描节点实现
 # ---------------------------------------------------------------------------
+def _build_context_manager(settings: Settings) -> ContextManager:
+    """【优化 O-8】从配置构造扫描用的上下文治理器（spill 目录解析为绝对路径）。"""
+    return ContextManager(
+        context_window=int(getattr(settings, "context_window", 128_000)),
+        threshold_ratio=float(getattr(settings, "context_threshold_ratio", 0.8)),
+        retain_ratio=float(getattr(settings, "context_retain_ratio", 0.16)),
+        spill_root=str(resolve(getattr(settings, "spill_root", "output/spill"))),
+        max_inline_bytes=int(getattr(settings, "spill_max_inline_bytes", 4096)),
+        prune_threshold_chars=int(getattr(settings, "prune_threshold_chars", 8192)),
+        prune_head_chars=int(getattr(settings, "prune_head_chars", 4096)),
+        prune_tail_chars=int(getattr(settings, "prune_tail_chars", 1024)),
+        enable_spill=bool(getattr(settings, "context_enable_spill", True)),
+        enable_compaction=bool(getattr(settings, "context_enable_compaction", True)),
+    )
+
+
 def run_scan_agent(
     agent: str,
     report_template: Dict[str, Any],
@@ -207,6 +272,7 @@ def run_scan_agent(
     settings = load_settings()
     file_path = state.get("file_path", "")
     code = state.get("code", "")
+    session_id = state.get("session_id", "scan")
     array_key = _report_array_key(report_template)
 
     with track_time(f"scan.{agent}"):
@@ -215,8 +281,10 @@ def run_scan_agent(
             log_event("scan.fallback", agent=agent, note="LLM 未配置，返回空报告骨架")
             report = empty_report(report_template, agent, file_path)
         else:
+            ctx = _build_context_manager(settings)  # 【优化 O-8】
             report = _scan_with_llm(
-                agent, code, file_path, settings, llm, report_template, finding_template
+                agent, code, file_path, settings, llm, report_template,
+                finding_template, ctx, session_id,
             )
 
     log_event("scan.done", agent=agent, findings=len(report.get(array_key, [])))
@@ -224,22 +292,65 @@ def run_scan_agent(
 
 
 def _scan_with_llm(
-    agent, code, file_path, settings, llm, report_template, finding_template
+    agent, code, file_path, settings, llm, report_template, finding_template,
+    ctx: "ContextManager", session_id: str,
 ) -> Dict[str, Any]:
     from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
     system = role_prompt_for(agent, settings) + "\n\n" + build_schema_hint(
         report_template, finding_template
     )
+
+    # 【优化 O-8】大源码外存（A 篇 spill）：完整源码落盘，模型只见首尾 + 位置。
+    # 小文件（小于内联字节预算）原样返回，行为与优化前完全一致。
+    code_view, code_locator = ctx.prepare_large_input(
+        code or "",
+        session_id=session_id,
+        tool_name=f"scan-{agent}-source",
+        call_id=f"{agent}-source",
+    )
+    code_block = f"待扫描文件: {file_path}\n\n```c\n{code_view}\n```"
+    if code_locator:
+        code_block += (
+            "\n\n[注意] 该文件较大，完整源码已外存到："
+            f"{code_locator}（可用 read 工具按 offset/limit 读取）。"
+            "本次仅提供首尾片段，请据此识别风险，并在证据中注明未能覆盖的中段。"
+        )
+        log_event("scan.source_spilled", agent=agent, locator=code_locator)
+
     messages = [
         SystemMessage(content=system),
-        HumanMessage(content=f"待扫描文件: {file_path}\n\n```c\n{code}\n```"),
+        HumanMessage(content=code_block),
     ]
+
+    # 【优化 O-8】调用前计量与压力记录（首轮单请求，主要做可观测的预算检查）
+    pressure = ctx.pressure(messages)
+    log_event(
+        "scan.pressure",
+        agent=agent,
+        tokens=pressure.total_tokens,
+        ratio=f"{pressure.ratio:.3f}",
+        over_threshold=pressure.over_threshold,
+    )
 
     last_error: Optional[Exception] = None
     for attempt in range(1, settings.max_retries + 1):
+        # 【优化 O-8】每次 invoke（含格式修复重试）前统一做预算治理
+        messages, report = ctx.enforce_budget(
+            messages, llm=llm, session_id=session_id, phase=f"scan.{agent}.attempt-{attempt}"
+        )
+        if report.acted:
+            log_event(
+                "scan.context_enforce",
+                agent=agent,
+                before=report.before_tokens,
+                after=report.after_tokens,
+                pruned=report.pruned_replacements,
+                compact=report.compact_ok,
+            )
+
         response = llm.invoke(messages)
-        text = getattr(response, "content", str(response))
+        text = response_text(response)
         try:
             raw = parse_json_object(text)
             return normalize_report(raw, agent, file_path, report_template, finding_template)

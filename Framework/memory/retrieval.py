@@ -90,11 +90,10 @@ def _llm_similar(
         ensure_ascii=False,
     )
     resp = llm.invoke([SystemMessage(content=system), HumanMessage(content=human)])
-    text = getattr(resp, "content", str(resp))
 
-    from agents import parse_json_object  # 延迟导入，避免循环
+    from agents import parse_json_object, response_text  # 延迟导入，避免循环
 
-    data = parse_json_object(text)
+    data = parse_json_object(response_text(resp))
     matches = data.get("matches")
     if not isinstance(matches, list):
         raise ValueError("LLM 检索返回结构非法")

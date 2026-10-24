@@ -33,14 +33,23 @@ def write_verification(
     status: str,
     confidence: float,
     reason: str,
+    *,
+    verdict: Optional[str] = None,
+    evidence: Optional[Dict[str, Any]] = None,
+    conflict: bool = False,
 ) -> str:
-    """写入一条验证记录（工具调用 + D 的推断），返回记录 id。"""
+    """写入一条验证记录（工具调用 + D 的推断 + 双信号结论），返回记录 id。
+
+    ``verdict`` / ``evidence`` / ``conflict`` 为「假设条件 + 触发路径」核验新增的
+    可选字段（关键字传参，旧调用方向后兼容）。
+    """
     row_id = uuid.uuid4().hex
     conn.execute(
         'INSERT INTO "view"'
         " (id, session_id, hypothesis_json, tool_call_json, tool_result_json,"
-        "  inference_json, status, confidence, reason, created_at)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "  inference_json, status, confidence, reason, verdict, evidence_json,"
+        "  conflict, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             row_id,
             session_id,
@@ -51,6 +60,9 @@ def write_verification(
             status,
             float(confidence or 0.0),
             reason or "",
+            verdict or "",
+            _dumps(evidence or {}),
+            1 if conflict else 0,
             _now(),
         ),
     )
@@ -77,6 +89,9 @@ def read_views(conn: sqlite3.Connection, session_id: str) -> List[Dict[str, Any]
                 "status": r["status"],
                 "confidence": r["confidence"],
                 "reason": r["reason"],
+                "verdict": _row_get(r, "verdict"),
+                "evidence": _loads(_row_get(r, "evidence_json")),
+                "conflict": bool(_row_get(r, "conflict") or 0),
                 "created_at": r["created_at"],
             }
         )
@@ -89,3 +104,14 @@ def _loads(text: Optional[str]) -> Dict[str, Any]:
         return data if isinstance(data, dict) else {"value": data}
     except json.JSONDecodeError:
         return {}
+
+
+def _row_get(row: Any, key: str, default: Any = None) -> Any:
+    """安全取列：旧库未迁移 / 列缺失时返回默认值，不抛错。"""
+    try:
+        if key not in row.keys():
+            return default
+        value = row[key]
+    except Exception:  # pragma: no cover - 非 sqlite3.Row 的兜底
+        return default
+    return default if value is None else value

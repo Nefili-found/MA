@@ -172,12 +172,33 @@ START ──┼─> B ─┼─> D ─> END
       "location": { "file": "", "line_start": 0, "line_end": 0, "function": "" },
       "taint_chain": [],
       "verification_status": "verified|rejected|uncertain",
+      "verdict": "accept|reject|challenge|uncertain",
       "confidence": 0.0,
-      "fix_suggestion": ""
+      "fix_suggestion": "",
+      "evidence": {
+        "path_status": "reachable|unreachable|unverifiable",
+        "path": [
+          { "hop": 0, "from": "", "to": "", "file": "", "line": 0,
+            "code": "", "reachable": true, "note": "" }
+        ],
+        "conditions": [
+          { "id": "cond-1", "kind": "null_check|bounds_check|sanitizer|other",
+            "text": "", "holds": true, "blocker": null, "note": "" }
+        ],
+        "blockers": [
+          { "file": "", "line": 0, "kind": "", "pattern": "", "symbol": "", "code": "" }
+        ],
+        "used_tools": ["get_callees", "get_callers", "get_function_body"]
+      }
     }
   ]
 }
 ```
+
+`verification_status` 是框架统一语义（verified / rejected / uncertain），`verdict` 是工具与 LLM
+双信号合并后的对抗式判定；`evidence` 记录「为什么这样判」——逐跳可达性、每条假设条件的核验结果、
+以及反驳条件的守卫（blocker）。被推翻（overturn）的 finding 默认不写进本文件，但完整记录仍在
+`memory.db` 的 `"view"` 表中。
 
 ---
 

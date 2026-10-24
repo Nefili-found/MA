@@ -24,6 +24,13 @@ class ScanState(TypedDict, total=False):
     file_path: str
     code: str
 
+    # ---- 修复端输入元数据（由 main.py 的 CLI 参数注入）----
+    # 只影响 output/repair_input.json；final_report.json 不依赖这些
+    case_id: str      # 用例目录名（批次内唯一）
+    repo: str         # 上游仓库名
+    commit: str       # 被扫描文件对应的上游 commit
+    rel_file: str     # 仓库相对路径（用于跨机器复现）
+
     # ---- A/B/C 原始报告：{"A": {...}, "B": {...}, "C": {...}} ----
     reports: Annotated[Dict[str, Any], merge_reports]
 
@@ -35,6 +42,9 @@ class ScanState(TypedDict, total=False):
 
     # ---- 最终输出 JSON ----
     final_report: Dict[str, Any]
+
+    # ---- 面向修复端的输入投影（repair-input/1）----
+    repair_input: Dict[str, Any]
 
     # ---- 会话 id（记忆库隔离用）----
     session_id: str

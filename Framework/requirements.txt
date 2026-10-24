@@ -8,5 +8,9 @@ langchain-core>=1.0,<2.0
 langchain-openai>=1.0,<2.0
 pyyaml>=6.0
 python-dotenv>=1.0
-tree-sitter>=0.22
-tree-sitter-cpp>=0.22
+# tree-sitter：Python 绑定与 grammar 的 ABI 必须匹配（本仓库 cpp grammar 为 ABI 14）。
+# 实测：tree-sitter 0.26.x 绑定会在 Windows 的 GC/退出阶段触发原生访问冲突
+# (0xC0000005)；绑定 0.25.x 已验证解析正常、无崩溃。
+# 保留 tree-sitter-cpp 以维持 C 与 C++ 两种源码支持。
+tree-sitter>=0.25,<0.26
+tree-sitter-cpp>=0.23.4,<0.24

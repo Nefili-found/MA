@@ -16,12 +16,31 @@ input:
 
 output:
   path: output/final_report.json
+  repair_input_path: output/repair_input.json   # 修复端输入投影（repair-input/1）
 
 retries:
   max: 3                    # Agent 输出格式错误时的最大重试次数
+
+# 验证环节双信号合并（父设计 §3.3 / 子设计 §4.5）
+verify:
+  tau: 0.8                  # 工具信号单方 overturn 的置信度阈值（blocker 命中封顶 0.55，不会过线）
+  drop_rejected: true       # overturn 的 finding 是否从最终输出剔除（false = 只打标不丢）
 
 logging:
   enabled: true
 
 prompts:
   roles_path: prompts/roles.yaml
+
+# 【优化 O-10】上下文治理（对应 A 篇第 09 章：计量 / 裁剪 / 外存 / 压缩）
+context:
+  window: 128000             # 模型上下文窗口（token），按实际模型调整
+  threshold_ratio: 0.8       # 占用 >= 80% 触发“裁剪 / 压缩”
+  retain_ratio: 0.16         # 压缩时保留最近 16% 原文
+  enable_spill: true         # 大结果 / 大输入外存（完整落盘，模型只看首尾 + 位置）
+  enable_compaction: true    # 摘要压缩（需 LLM；无 LLM 时自动跳过）
+  spill_root: output/spill   # 外存文件目录（相对项目根）
+  spill_max_inline_bytes: 4096   # 工具结果 / 大输入内联字节上限，超过即外存
+  prune_threshold_chars: 8192    # 历史工具结果超过该字符数才裁剪
+  prune_head_chars: 4096         # 裁剪保留头部
+  prune_tail_chars: 1024         # 裁剪保留尾部

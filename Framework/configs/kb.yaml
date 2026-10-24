@@ -1,0 +1,42 @@
+# 知识库建库配置（Phase 1：抽取 / 抽象 / 嵌入 / 存储）
+# 优先级：本文件 < 环境变量 / config/.env
+# 未知键会直接报错（防"开关名写错 → 静默跑默认值"污染消融结果）。
+# 设计依据：change_process/design/知识库_双视图抽取与存储_代码方案_设计.md §6.2
+
+pairs_root: "other fix framework/datasets/patchdb_cvefixes_for_appatch_train"
+out_dir: "artifacts/kb-v1"
+runs_dir: "runs"
+cache_dir: ".cache/kb"
+kb_ver: "kb-v1"
+
+extract:
+  # model / base_url / api_key 走 config/.env 或 --provider（openai | deepseek）
+  temperature: 0.0
+  max_tokens: 2048    # 实测 1024 会被长回答截断在 JSON 中间 → 解析失败（4/12 对因此被拒）
+  prompt_ver: "kb-extract-v1"
+  retries: 1          # JSON 解析失败的重试次数（重试时自动放大 max_tokens）
+
+abstract:
+  enabled: true
+  max_retry: 1        # 抽象度检查违例后的再改写次数
+  prompt_ver: "kb-abstract-v1"
+
+evidence:
+  mode: "tree_sitter" # tree_sitter | none（none = 论文原样纯 LLM 抽取，消融对照）
+  max_df_items: 40
+  max_cf_items: 20
+
+embed:
+  model: "sentence-transformers/all-MiniLM-L6-v2"
+  dim: 384
+  batch: 64
+
+gate:
+  max_root_cause_chars: 300
+  max_strategy_chars: 500
+  max_behavior_chars: 400   # 300 时 2/24 条 control_branch 被截断（容忍上限：1/24）
+  max_calls: 8
+
+run:
+  concurrency: 4
+  cache: true

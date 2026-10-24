@@ -1,0 +1,43 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# ===== IDE / 工具缓存 =====
+.idea/
+*.iml
+.vscode/
+.cache/
+.reasonix/
+
+# ===== 密钥 / 本地配置（保留示例文件）=====
+.env
+config/.env
+*.secret
+!*.env.example
+!config/.env.example
+
+# ===== 运行产物 / 本地数据库 =====
+memory.db
+*.db
+*.sqlite
+*.sqlite3
+output/*.json
+!output/.gitkeep
+output/spill/
+runs/
+
+# ===== 系统文件 / 日志 =====
+.DS_Store
+Thumbs.db
+desktop.ini
+*.log
+
+# ===== 大体积数据 / 外部副本（不入库，另行管理）=====
+test_data/primevul_raw/
+other fix framework/

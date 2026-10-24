@@ -12,7 +12,14 @@ A:
     1. Scan the source code based on Abstract Syntax Tree (AST), Control Flow Graph (CFG), and Data Flow Analysis (DFA).
     2. Identify source-code-level vulnerability features: unvalidated external input, unsafe API calls, tainted data propagation, null pointer dereference, uninitialized variables, hardcoded secrets, etc.
     3. Locate the line numbers of vulnerabilities and taint propagation chains.
-    4. Generate structured vulnerability assumptions (assume): describe triggering prerequisites, vulnerability types and potential hazards.
+    4. Generate structured vulnerability assumptions: for every finding, fill the `assumptions` array with the triggering prerequisites (see 【Report fields】).
+
+    【Report fields】
+    You must fill every field of the finding schema. Three of them drive automated verification:
+    * `propagation_path`: ordered source→sink node names, using **function names defined in this file** (e.g. ["main","handle","strcpy"]). If a hop cannot be expressed as a function name, write the raw expression — downstream verification will mark that hop unverifiable instead of guessing.
+    * `assumptions`: list of {"id", "kind", "text"}. For your view prefer kind = "sanitizer" (external input consumed without validation / escaping). `text` must name the concrete variable and the missing check, e.g. "argv[1] is copied into buf without any length validation".
+    * `assumptions[].kind` must be exactly one of: null_check / bounds_check / sanitizer / other.
+    Also: `severity` ∈ {critical, high, medium, low}; `confidence` ∈ [0,1]; `id` = "A-<n>" unique within your report; `taint_source` / `taint_sink` name the concrete expression or API.
 
     【Constraints】
     1. Forbid simulating program execution; do not infer runtime behavior.
@@ -28,7 +35,14 @@ B:
     1. Deduce program execution branches, exception handling logic, and external input interaction workflows.
     2. Identify reachable abnormal execution paths: missing error handling, logical privilege escalation, flaws in conditional judgment, abnormal branches triggered by malicious input.
     3. Analyze program business behaviors and logical anomalies under malicious input.
-    4. Generate structured vulnerability assumptions (assume): describe under what input conditions the program will enter abnormal paths and produce consequences.
+    4. Generate structured vulnerability assumptions: for every finding, fill the `assumptions` array with the input conditions that lead into the abnormal path (see 【Report fields】).
+
+    【Report fields】
+    You must fill every field of the finding schema. Three of them drive automated verification:
+    * `propagation_path`: the **reachable** branch / function chain from source to sink, written as function names defined in this file (e.g. ["main","dispatch","handle_request"]). Never list a hop that does not actually exist in the code.
+    * `assumptions`: list of {"id", "kind", "text"}. For your view prefer kind = "null_check" (a validity check missing before the sink) or "other" for pure branch-reachability conditions (e.g. "an attacker-controlled length reaches the loop bound").
+    * `assumptions[].kind` must be exactly one of: null_check / bounds_check / sanitizer / other.
+    Also: `severity` ∈ {critical, high, medium, low}; `confidence` ∈ [0,1]; `id` = "B-<n>" unique within your report.
 
     【Constraints】
     1. Do not analyze memory layout details such as stack, heap and structures.
@@ -44,7 +58,14 @@ C:
     1. Parse the memory arrangement of variables, arrays and structs on the stack/heap.
     2. Identify memory risks: stack buffer overflow, heap overflow, Use-After-Free, out-of-bounds read and write, memory alignment defects, missing length validation.
     3. Evaluate whether malicious input can tamper with adjacent memory objects.
-    4. Generate structured vulnerability assumptions (assume): describe what input conditions will corrupt the memory layout and achieve memory tampering.
+    4. Generate structured vulnerability assumptions: for every finding, fill the `assumptions` array with the input conditions that corrupt memory (see 【Report fields】).
+
+    【Report fields】
+    You must fill every field of the finding schema. Three of them drive automated verification:
+    * `propagation_path`: ordered source→sink node names using **function names defined in this file** (e.g. ["main","parse_packet","memcpy"]).
+    * `assumptions`: list of {"id", "kind", "text"}. For your view prefer kind = "bounds_check". `text` must state which buffer and which write size, e.g. "memcpy(dst, src, len) writes len bytes into a fixed 32-byte stack buffer with no bound check".
+    * `assumptions[].kind` must be exactly one of: null_check / bounds_check / sanitizer / other.
+    Also: `severity` ∈ {critical, high, medium, low}; `confidence` ∈ [0,1]; `id` = "C-<n>" unique within your report.
 
     【Constraints】
     1. Do not analyze pure business logic vulnerabilities or syntax-level taint vulnerabilities.

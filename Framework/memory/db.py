@@ -29,6 +29,9 @@ CREATE TABLE IF NOT EXISTS "view" (
     status            TEXT,
     confidence        REAL,
     reason            TEXT,
+    verdict           TEXT,
+    evidence_json     TEXT,
+    conflict          INTEGER DEFAULT 0,
     created_at        TEXT NOT NULL
 );
 
@@ -52,4 +55,31 @@ def get_connection(db_path: Union[str, Path]) -> sqlite3.Connection:
 
 def _init_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    # 幂等迁移：旧库（无 verdict / evidence_json / conflict）开机自动补列。
+    # 「假设条件 + 触发路径」核验（D 双信号）需要把 verdict / evidence / conflict
+    # 落到 view 表，便于审计与回放。
+    _ensure_columns(
+        conn,
+        "view",
+        {
+            "verdict": "TEXT",
+            "evidence_json": "TEXT",
+            "conflict": "INTEGER DEFAULT 0",
+        },
+    )
     conn.commit()
+
+
+def _ensure_columns(
+    conn: sqlite3.Connection, table: str, columns: dict
+) -> None:
+    """给已存在的表补上缺失列（幂等；SQLite 不支持 ADD COLUMN IF NOT EXISTS）。"""
+    try:
+        rows = conn.execute(f'PRAGMA table_info("{table}")').fetchall()
+    except Exception:  # pragma: no cover - 表不存在等异常
+        return
+    existing = {row["name"] if "name" in row.keys() else row[1] for row in rows}
+    for name, ddl in columns.items():
+        if name in existing:
+            continue
+        conn.execute(f'ALTER TABLE "{table}" ADD COLUMN {name} {ddl}')

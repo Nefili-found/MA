@@ -47,8 +47,17 @@ def track_time(label: str) -> Iterator[Dict[str, Any]]:
 def count_tokens(text: str, model: Optional[str] = None) -> int:
     """粗略 token 估算（约 4 字符/token）。
 
+    【优化 O-9】统一计量口径：复用 context.meter 的 ``estimate_tokens``
+    （ceil 向上取整，与 TokenMeter / 压力计算完全一致），避免出现两处
+    估算结果不一致；惰性导入，不引入循环依赖。无法导入时回退旧实现。
+
     TODO: 如需精确统计，接入 tiktoken（langchain-openai 已依赖 tiktoken）。
     """
     if not text:
         return 0
-    return max(1, len(text) // 4)
+    try:
+        from context.meter import estimate_tokens
+
+        return estimate_tokens(text)
+    except Exception:
+        return max(1, len(text) // 4)

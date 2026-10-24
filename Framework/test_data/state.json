@@ -1,0 +1,150 @@
+{
+  "target": 5,
+  "min_lines": 20,
+  "max_lines": 150,
+  "started_at": "2026-10-12T16:33:53",
+  "files": [
+    {
+      "path": "primevul_test.jsonl",
+      "size": 66064689,
+      "processed_bytes": 11741,
+      "processed_lines": 12
+    },
+    {
+      "path": "primevul_valid.jsonl",
+      "size": 63564497,
+      "processed_bytes": 0,
+      "processed_lines": 0
+    },
+    {
+      "path": "primevul_train.jsonl",
+      "size": 438865920,
+      "processed_bytes": 0,
+      "processed_lines": 0
+    }
+  ],
+  "per_function": [
+    {
+      "seq": 1,
+      "id": 90104,
+      "file": "primevul_test.jsonl",
+      "line_no": 1,
+      "byte_offset": 0,
+      "line_count": 25,
+      "status": "accepted"
+    },
+    {
+      "seq": 2,
+      "id": 90105,
+      "file": "primevul_test.jsonl",
+      "line_no": 2,
+      "byte_offset": 1397,
+      "line_count": 4,
+      "status": "skipped_too_short"
+    },
+    {
+      "seq": 3,
+      "id": 90106,
+      "file": "primevul_test.jsonl",
+      "line_no": 3,
+      "byte_offset": 2082,
+      "line_count": 4,
+      "status": "skipped_too_short"
+    },
+    {
+      "seq": 4,
+      "id": 90107,
+      "file": "primevul_test.jsonl",
+      "line_no": 4,
+      "byte_offset": 2774,
+      "line_count": 1,
+      "status": "skipped_too_short"
+    },
+    {
+      "seq": 5,
+      "id": 90108,
+      "file": "primevul_test.jsonl",
+      "line_no": 5,
+      "byte_offset": 3345,
+      "line_count": 20,
+      "status": "accepted"
+    },
+    {
+      "seq": 6,
+      "id": 90109,
+      "file": "primevul_test.jsonl",
+      "line_no": 6,
+      "byte_offset": 4631,
+      "line_count": 2,
+      "status": "skipped_too_short"
+    },
+    {
+      "seq": 7,
+      "id": 90110,
+      "file": "primevul_test.jsonl",
+      "line_no": 7,
+      "byte_offset": 5256,
+      "line_count": 9,
+      "status": "skipped_too_short"
+    },
+    {
+      "seq": 8,
+      "id": 90111,
+      "file": "primevul_test.jsonl",
+      "line_no": 8,
+      "byte_offset": 6051,
+      "line_count": 24,
+      "status": "accepted"
+    },
+    {
+      "seq": 9,
+      "id": 90112,
+      "file": "primevul_test.jsonl",
+      "line_no": 9,
+      "byte_offset": 7469,
+      "line_count": 28,
+      "status": "accepted"
+    },
+    {
+      "seq": 10,
+      "id": 90113,
+      "file": "primevul_test.jsonl",
+      "line_no": 10,
+      "byte_offset": 9336,
+      "line_count": 8,
+      "status": "skipped_too_short"
+    },
+    {
+      "seq": 11,
+      "id": 90114,
+      "file": "primevul_test.jsonl",
+      "line_no": 11,
+      "byte_offset": 10009,
+      "line_count": 7,
+      "status": "skipped_too_short"
+    },
+    {
+      "seq": 12,
+      "id": 90115,
+      "file": "primevul_test.jsonl",
+      "line_no": 12,
+      "byte_offset": 10643,
+      "line_count": 23,
+      "status": "accepted"
+    }
+  ],
+  "per_function_truncated": false,
+  "counters": {
+    "evaluated": 12,
+    "accepted": 5,
+    "skipped_too_short": 7,
+    "skipped_too_long": 0,
+    "skipped_incomplete": 0,
+    "skipped_nonstring": 0,
+    "json_error": 0,
+    "other_error": 0
+  },
+  "done": true,
+  "updated_at": "2026-10-12T16:33:53",
+  "written_cases": 5
+}
