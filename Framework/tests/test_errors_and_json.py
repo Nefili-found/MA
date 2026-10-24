@@ -34,6 +34,7 @@ sys.path.insert(0, str(ROOT))
 import agents as agents_pkg  # noqa: E402
 import agents.a as agent_a  # noqa: E402
 import verify_agent.d as d  # noqa: E402
+import verify_agent.verify_loop as verify_loop  # noqa: E402
 from agents import _iter_json_objects, parse_json_object  # noqa: E402
 from config import load_settings  # noqa: E402
 from errors import FatalError, PipelineError, ScanError, VerifyError  # noqa: E402
@@ -176,7 +177,8 @@ def t_verify_error_isolates() -> None:
     ]
     state = {"file_path": "t.c", "code": CODE, "session_id": "sess-b2"}
 
-    original = d._invoke_verify
+    # 拆分后 _verify_findings 住在 verify_agent.verify_loop，补丁要打在它真正查找的模块上
+    original = verify_loop.invoke_verify
 
     def fake_invoke(hypothesis, context, llm, settings, ctx, session_id, finding_idx):  # noqa: ANN001
         if finding_idx == 0:
@@ -188,12 +190,12 @@ def t_verify_error_isolates() -> None:
             None,
         )
 
-    d._invoke_verify = fake_invoke
+    verify_loop.invoke_verify = fake_invoke
     errors: list = []
     try:
         out = d._verify_findings(findings, state, "sess-b2", conn, None, settings, ctx, errors=errors)
     finally:
-        d._invoke_verify = original
+        verify_loop.invoke_verify = original
         conn.close()
 
     assert [f["id"] for f in out] == ["A-1", "B-1"], out

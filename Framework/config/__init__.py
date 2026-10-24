@@ -47,6 +47,8 @@ class Settings:
     output_path: str = "output/final_report.json"
     repair_input_path: str = "output/repair_input.json"  # 修复端输入投影（repair-input/1）
     roles_path: str = "prompts/roles.yaml"
+    # 【20 文档 §5.2-8】D（去重 / 裁决 / 工具验证）的提示词外置文件
+    verify_prompts_path: str = "prompts/verify.yaml"
 
     # 【优化 O-10】上下文治理（A 篇第 09 章）：窗口 / 阈值 / 外存 / 裁剪 / 压缩
     context_window: int = 128_000          # 模型上下文窗口（token），按实际模型调整
@@ -135,6 +137,9 @@ def load_settings(config_path: Optional[str] = None) -> Settings:
             "REPAIR_INPUT_PATH", out.get("repair_input_path", "output/repair_input.json")
         ),
         roles_path=os.getenv("ROLES_PATH", prompts.get("roles_path", "prompts/roles.yaml")),
+        verify_prompts_path=os.getenv(
+            "VERIFY_PROMPTS_PATH", prompts.get("verify_path", "prompts/verify.yaml")
+        ),
         # 【优化 O-10】上下文治理配置：默认 < yaml(context 段) < 环境变量
         context_window=int(os.getenv("CONTEXT_WINDOW", ctx_cfg.get("window", 128_000) or 128_000)),
         context_threshold_ratio=float(

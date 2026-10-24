@@ -33,6 +33,7 @@ logging:
 
 prompts:
   roles_path: prompts/roles.yaml
+  verify_path: prompts/verify.yaml   # D（去重 / 裁决 / 工具验证）的提示词外置文件
 
 # 【优化 O-10】上下文治理（对应 A 篇第 09 章：计量 / 裁剪 / 外存 / 压缩）
 context:
