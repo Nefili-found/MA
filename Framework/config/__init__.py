@@ -63,6 +63,9 @@ class Settings:
     # 其他
     max_retries: int = 3
     log_enabled: bool = True
+    # 【健壮性包 B-1】日志格式 / 级别（对应 20 文档 §5.3-14）
+    log_format: str = "json"   # json = 一行一个 JSON 对象（可聚合）；text = [event] k=v
+    log_level: str = "info"    # debug / info / warn / error，低于该级别的事件被丢弃
 
     # 【假设条件 + 触发路径核验】双信号合并（父设计 §3.3）
     verify_tau: float = 0.8            # 工具信号单方 overturn 的置信度阈值 τ
@@ -161,6 +164,8 @@ def load_settings(config_path: Optional[str] = None) -> Settings:
         ),
         max_retries=int(os.getenv("MAX_RETRIES", retries.get("max", 3) or 3)),
         log_enabled=_as_bool(os.getenv("LOG_ENABLED", logging.get("enabled", True))),
+        log_format=os.getenv("LOG_FORMAT", logging.get("format", "json")),
+        log_level=os.getenv("LOG_LEVEL", logging.get("level", "info")),
         verify_tau=float(os.getenv("VERIFY_TAU", verify_cfg.get("tau", 0.8) or 0.8)),
         verify_drop_rejected=_as_bool(
             os.getenv("VERIFY_DROP_REJECTED", verify_cfg.get("drop_rejected", True))

@@ -29,11 +29,11 @@
 from __future__ import annotations
 
 import json
-import re
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from config import Settings, load_settings, resolve
 from context import ContextManager, content_to_text
+from errors import ScanError
 from observability import log_event, track_time
 
 # ---------------------------------------------------------------------------
@@ -99,13 +99,13 @@ def get_llm(settings: Optional[Settings] = None) -> Optional[Any]:
     settings = settings or load_settings()
     api_key = (settings.api_key or "").strip()
     if not api_key or api_key.upper().startswith("TODO"):
-        log_event("llm.skipped", reason="未配置有效 API Key")
+        log_event("llm.skipped", level="warn", reason="未配置有效 API Key")
         return None
 
     try:
         from langchain_openai import ChatOpenAI  # type: ignore
     except Exception as exc:  # pragma: no cover
-        log_event("llm.import_failed", error=str(exc))
+        log_event("llm.import_failed", level="warn", error=str(exc))
         return None
 
     # TODO: 如需支持其他 LLM 提供商（Anthropic / 本地模型等），请在此按 provider 分支。
@@ -145,7 +145,7 @@ def load_roles(settings: Optional[Settings] = None) -> Dict[str, Any]:
             if isinstance(loaded, dict):
                 data = loaded
         except Exception as exc:
-            log_event("roles.load_failed", error=str(exc))
+            log_event("roles.load_failed", level="warn", error=str(exc))
     _ROLES_CACHE = data
     return _ROLES_CACHE
 
@@ -177,21 +177,72 @@ def response_text(response: Any) -> str:
     return content_to_text(content)
 
 
+def _iter_json_objects(text: str) -> List[str]:
+    """按平衡花括号切出文本中所有顶层 JSON 对象候选。
+
+    【健壮性包 B-3】与旧实现 ``text[find("{"):rfind("}")]`` 的区别：
+    * 字符串字面量与转义内的花括号（``"a{b"`` / ``"\\"}"``）不再干扰边界；
+    * 一段文本里出现多个 JSON 块时逐个给出，不会把中间的散文一起切进去；
+    * 被截断的未闭合对象直接丢弃，交给调用方报错，而不是猜一个边界。
+    """
+    objects: List[str] = []
+    depth = 0
+    start = -1
+    in_string = False
+    escaped = False
+    for i, ch in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            if depth == 0:
+                continue  # 多余的右花括号：忽略
+            depth -= 1
+            if depth == 0 and start >= 0:
+                objects.append(text[start : i + 1])
+                start = -1
+    return objects
+
+
 def parse_json_object(text: str) -> Dict[str, Any]:
-    """从模型输出中提取第一个 JSON 对象，容忍 ```json 包裹与前后噪声。"""
+    """从模型输出中提取第一个可解析的 JSON **对象**。
+
+    容忍：``` 围栏、前后散文、同一回复里多个 JSON 块、字符串里含花括号。
+    全部候选都解析失败时，错误信息带偏移与片段预览（而不是只说“未找到 JSON”）。
+    """
     if not text:
         raise ValueError("模型输出为空")
-    fenced = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
-    if fenced:
-        text = fenced.group(1)
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        raise ValueError("未找到 JSON 对象")
-    data = json.loads(text[start : end + 1])
-    if not isinstance(data, dict):
-        raise ValueError("顶层不是 JSON 对象")
-    return data
+    candidates = _iter_json_objects(text)
+    if not candidates:
+        preview = text.strip()[:120].replace("\n", " ")
+        raise ValueError(f"未找到完整的 JSON 对象（输出片段: {preview!r}）")
+
+    failures: List[str] = []
+    for idx, candidate in enumerate(candidates):
+        offset = text.find(candidate)
+        try:
+            data = json.loads(candidate)
+        except json.JSONDecodeError as exc:
+            failures.append(
+                f"候选 #{idx + 1}（偏移 {offset}）解析失败: {exc.msg}（char {exc.pos}）"
+            )
+            continue
+        if isinstance(data, dict):
+            return data
+        failures.append(f"候选 #{idx + 1} 顶层不是对象（{type(data).__name__}）")
+    raise ValueError("；".join(failures) or "未找到可解析的 JSON 对象")
 
 
 def normalize_report(
@@ -268,6 +319,10 @@ def run_scan_agent(
     """A/B/C 共用的扫描节点：返回 ``{"reports": {agent: report}}``。
 
     报告结构由调用方（各 agent 文件）通过 report_template / finding_template 传入。
+
+    【健壮性包 B-2】扫描失败不再崩图：``ScanError``（LLM 不可用 / 格式修复超限 /
+    调用抛错）在此被捕获 → 降级为空报告骨架 + 记入 ``state["errors"]``，
+    流水线照常进到 D。非 ``ScanError`` 的异常（编程缺陷）照旧冒泡。
     """
     settings = load_settings()
     file_path = state.get("file_path", "")
@@ -275,20 +330,33 @@ def run_scan_agent(
     session_id = state.get("session_id", "scan")
     array_key = _report_array_key(report_template)
 
+    errors: List[str] = []
     with track_time(f"scan.{agent}"):
         llm = get_llm(settings)
         if llm is None:
-            log_event("scan.fallback", agent=agent, note="LLM 未配置，返回空报告骨架")
+            log_event(
+                "scan.fallback",
+                level="warn",
+                agent=agent,
+                note="LLM 未配置，返回空报告骨架",
+            )
             report = empty_report(report_template, agent, file_path)
+            errors.append(f"scan.{agent}: LLM 未配置，已降级为空报告")
         else:
             ctx = _build_context_manager(settings)  # 【优化 O-8】
-            report = _scan_with_llm(
-                agent, code, file_path, settings, llm, report_template,
-                finding_template, ctx, session_id,
-            )
+            try:
+                report = _scan_with_llm(
+                    agent, code, file_path, settings, llm, report_template,
+                    finding_template, ctx, session_id,
+                )
+            except ScanError as exc:
+                # 【健壮性包 B-2】可降级失败：空报告 + errors，图继续跑到 D
+                log_event("scan.degraded", level="warn", agent=agent, error=str(exc))
+                report = empty_report(report_template, agent, file_path)
+                errors.append(f"scan.{agent}: {exc}")
 
     log_event("scan.done", agent=agent, findings=len(report.get(array_key, [])))
-    return {"reports": {agent: report}}
+    return {"reports": {agent: report}, "errors": errors}
 
 
 def _scan_with_llm(
@@ -349,20 +417,24 @@ def _scan_with_llm(
                 compact=report.compact_ok,
             )
 
-        response = llm.invoke(messages)
+        # 【健壮性包 B-2】LLM 调用失败（网络 / 鉴权 / 限流）也是可降级失败
+        try:
+            response = llm.invoke(messages)
+        except Exception as exc:
+            raise ScanError(f"LLM 调用失败: {type(exc).__name__}: {exc}") from exc
         text = response_text(response)
         try:
             raw = parse_json_object(text)
             return normalize_report(raw, agent, file_path, report_template, finding_template)
         except Exception as exc:  # 自动修复/重试
             last_error = exc
-            log_event("scan.repair", agent=agent, attempt=attempt, error=str(exc))
+            log_event("scan.repair", level="warn", agent=agent, attempt=attempt, error=str(exc))
             messages.append(AIMessage(content=text))
             messages.append(
                 HumanMessage(
                     content="上面的输出不是合法 JSON。请只输出符合 schema 的合法 JSON，不要任何多余内容。"
                 )
             )
-    raise RuntimeError(
-        f"Agent {agent} 报告格式修复失败（已重试 {settings.max_retries} 次）: {last_error}"
+    raise ScanError(
+        f"报告格式修复失败（已重试 {settings.max_retries} 次）: {last_error}"
     )

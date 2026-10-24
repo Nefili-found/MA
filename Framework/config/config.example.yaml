@@ -28,6 +28,8 @@ verify:
 
 logging:
   enabled: true
+  format: json              # json = 一行一个 JSON 对象（可被聚合/grep 解析）；text = [event] k=v
+  level: info               # debug / info / warn / error（低于该级别的事件不输出）
 
 prompts:
   roles_path: prompts/roles.yaml

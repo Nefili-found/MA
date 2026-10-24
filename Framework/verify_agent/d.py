@@ -52,6 +52,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from agents import get_llm, load_settings, parse_json_object, response_text
 from config import resolve
 from context import ContextManager
+from errors import FatalError, VerifyError
 from memory import db as mem_db
 from memory.ledger import write_report
 from memory.retrieval import find_similar_findings
@@ -164,7 +165,8 @@ def run(state: Dict[str, Any]) -> Dict[str, Any]:
     # 1) 校验三份报告齐全
     missing = [a for a in REQUIRED_AGENTS if a not in reports]
     if missing:
-        raise RuntimeError(f"D 未接收到全部报告，缺失: {missing}。已停止。")
+        # 【健壮性包 B-2】A/B/C 均已降级，仍缺报告 = 编排缺陷，不可恢复
+        raise FatalError(f"D 未接收到全部报告，缺失: {missing}。已停止。")
 
     session_id = state.get("session_id", "")
     code = state.get("code", "")
@@ -190,8 +192,12 @@ def run(state: Dict[str, Any]) -> Dict[str, Any]:
             merged = _adjudicate(merged, llm)
 
         # 5) 工具验证（内部接入上下文治理）
+        #    【健壮性包 B-2】单条 finding 验证失败只隔离该条，不中断整轮
+        verify_errors: List[str] = []
         with track_time("verify"):
-            verified = _verify_findings(merged, state, session_id, conn, llm, settings, ctx)
+            verified = _verify_findings(
+                merged, state, session_id, conn, llm, settings, ctx, errors=verify_errors
+            )
 
         # 6) 精简最终报告并落盘
         final = _build_final_report(file_path, verified)
@@ -220,12 +226,14 @@ def run(state: Dict[str, Any]) -> Dict[str, Any]:
         findings=len(final["findings"]),
         repair_cases=len(cases),
         repair_invalid=sum(1 for c in cases if not (c.get("validation") or {}).get("ok")),
+        verify_errors=len(verify_errors),
     )
     return {
         "merged_findings": merged,
         "verified_findings": verified,
         "final_report": final,
         "repair_input": repair_input,
+        "errors": verify_errors,
     }
 
 
@@ -495,6 +503,27 @@ def _resolve_location(
 # ---------------------------------------------------------------------------
 # 工具验证
 # ---------------------------------------------------------------------------
+def _degraded_item(finding: Dict[str, Any], error: VerifyError) -> Dict[str, Any]:
+    """【健壮性包 B-2】验证步骤失败时的降级产物。
+
+    保留 finding 本体（宁可交一条 ``uncertain``，也不静默丢掉一条可能真存在的漏洞），
+    只把验证结论退化为 uncertain，并在 ``verify_error`` 里留原因。
+    """
+    item = dict(finding)
+    item["verification_status"] = "uncertain"
+    item["verdict"] = "uncertain"
+    item["confidence"] = round(float(finding.get("confidence", 0.0) or 0.0), 4)
+    item["evidence"] = {
+        "path_status": "unverified",
+        "path": [],
+        "conditions": [],
+        "blockers": [],
+        "used_tools": [],
+    }
+    item["verify_error"] = str(error)
+    return item
+
+
 def _verify_findings(
     merged: List[Dict[str, Any]],
     state: Dict[str, Any],
@@ -503,6 +532,7 @@ def _verify_findings(
     llm: Optional[Any],
     settings: Any,
     ctx: ContextManager,  # 【优化 O-7】注入上下文治理器
+    errors: Optional[List[str]] = None,  # 【健壮性包 B-2】失败条目回流到 state["errors"]
 ) -> List[Dict[str, Any]]:
     file_path = state.get("file_path", "")
     code = state.get("code", "")
@@ -530,15 +560,27 @@ def _verify_findings(
         # 信号 1：工具（代码事实，独立于 LLM）
         tool_sig = _signal_tool(hypothesis, context)
         # 信号 2：LLM（语义，复用 bind_tools 多轮；无 LLM 时为 None）
-        tool_call, tool_result, context_reports, llm_sig = _invoke_verify(
-            hypothesis, context, llm, settings, ctx, session_id, finding_idx
-        )
-
-        if tool_result is None:
-            raise RuntimeError("工具调用无结果，停止。")
-        tool_status = tool_result.get("status", "uncertain")
-        if tool_status not in ("verified", "rejected", "uncertain"):
-            raise RuntimeError(f"工具返回非法状态: {tool_status!r}，停止。")
+        # 【健壮性包 B-2】VerifyError 只隔离当前 finding：标 uncertain + 记 errors，继续下一条
+        try:
+            tool_call, tool_result, context_reports, llm_sig = _invoke_verify(
+                hypothesis, context, llm, settings, ctx, session_id, finding_idx
+            )
+            if tool_result is None:
+                raise VerifyError("工具调用无结果")
+            tool_status = tool_result.get("status", "uncertain")
+            if tool_status not in ("verified", "rejected", "uncertain"):
+                raise VerifyError(f"工具返回非法状态: {tool_status!r}")
+        except VerifyError as exc:
+            log_event(
+                "verify.degraded",
+                level="warn",
+                finding_id=f.get("id", ""),
+                error=str(exc),
+            )
+            if errors is not None:
+                errors.append(f"verify:{f.get('id', '')}: {exc}")
+            verified.append(_degraded_item(f, exc))
+            continue
 
         verdict = _combine(tool_sig, llm_sig, tau)
         confidence = verdict["confidence"]
@@ -738,7 +780,7 @@ def _invoke_verify(
       （循环内接入上下文治理）；
     * 否则：直接调用 verify_taint（使用含完整 code 的内部 context）。
 
-    工具异常一律转换为 RuntimeError（停止并报错）。
+    工具异常一律转为 ``VerifyError``（只隔离当前 finding，不中断整轮）。
     返回 (tool_call, tool_result, context_reports, llm_sig)：
 
     * ``llm_sig`` 为 LLM 侧裁决 ``{verdict, confidence, reason}``（父设计 §3.2 的
@@ -754,13 +796,13 @@ def _invoke_verify(
         except RuntimeError:
             raise
         except Exception as exc:
-            raise RuntimeError(f"工具调用失败: {exc}") from exc
+            raise VerifyError(f"工具调用失败: {exc}") from exc
 
     # 兜底：直接调用（无 LLM / 无工具）。这里使用完整 context，不受外存影响。
     try:
         result = verify_taint(hypothesis, context)
     except Exception as exc:
-        raise RuntimeError(f"工具调用失败: {exc}") from exc
+        raise VerifyError(f"工具调用失败: {exc}") from exc
     tool_call = {"tool": "verify_taint", "args": {"hypothesis": hypothesis, "context": context}}
     return tool_call, result, [], None
 
@@ -786,7 +828,7 @@ def _signal_tool(hypothesis: Dict[str, Any], context: Dict[str, Any]) -> Dict[st
     try:
         result = verify_taint(hypothesis, context)
     except Exception as exc:  # 纯工具信号不拖垮整图
-        log_event("verify.tool_signal_failed", error=f"{type(exc).__name__}: {exc}")
+        log_event("verify.tool_signal_failed", level="warn", error=f"{type(exc).__name__}: {exc}")
         return {
             "verdict": "uncertain",
             "confidence": 0.0,

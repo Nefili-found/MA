@@ -19,8 +19,9 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 from config import load_settings, resolve
+from errors import FatalError
 from graph import build_graph
-from observability import log_event, set_log_enabled
+from observability import configure_logging, log_event
 
 
 def read_code(file_path: Path) -> str:
@@ -74,7 +75,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     settings = load_settings(args.config)
-    set_log_enabled(settings.log_enabled)
+    configure_logging(settings.log_enabled, settings.log_format, settings.log_level)
 
     target = resolve(args.file or settings.input_file)
     if not target.exists():
@@ -113,7 +114,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     log_event("run.start", file=str(target), session=session_id)
     app = build_graph()
-    result = app.invoke(state, config={"recursion_limit": 50})
+    try:
+        result = app.invoke(state, config={"recursion_limit": 50})
+    except FatalError as exc:
+        # 【健壮性包 B-2】不可恢复错误：给清楚的一句话 + 非零退出码，不喷 traceback
+        log_event("run.fatal", level="error", session=session_id, error=str(exc))
+        print(f"[error] {exc}", file=sys.stderr)
+        return int(getattr(exc, "exit_code", 2))
     log_event(
         "run.done",
         session=session_id,
@@ -131,6 +138,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if (case.get("validation") or {}).get("ok"):
                 continue
             print(f"[warn] {case.get('case_id')}: {'; '.join(case['validation']['errors'])}")
+    # 【健壮性包 B-2】把降级/失败事件汇总给用户看：静默降级 = 静默丢能力
+    errors = result.get("errors") or []
+    if errors:
+        print(f"[warn] 本次运行记录了 {len(errors)} 条降级/失败事件：")
+        for item in errors:
+            print(f"[warn] {item}")
+
     print(f"[ok] 记忆库: {resolve(settings.db_path)}")
     print(f"[ok] session_id: {session_id}")
     return 0
