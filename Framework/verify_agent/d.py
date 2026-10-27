@@ -47,6 +47,7 @@ from verify_agent.location import as_int as _as_int
 from verify_agent.location import build_hypothesis as _build_hypothesis
 from verify_agent.location import norm_assumptions as _norm_assumptions
 from verify_agent.location import norm_path as _norm_path
+from verify_agent.location import normalize_slice_location as _normalize_slice_location
 from verify_agent.location import resolve_location as _resolve_location
 from verify_agent.prompts import DEFAULTS as PROMPT_DEFAULTS
 from verify_agent.prompts import load_verify_prompts
@@ -116,8 +117,13 @@ def run(state: Dict[str, Any]) -> Dict[str, Any]:
         for agent in REQUIRED_AGENTS:
             write_report(conn, session_id, agent, reports[agent], code)
 
-        # 3) 语义去重
+        # 3) 切片坐标归一：只有 --slice-start 给了才生效。
+        #    必须在去重前做——去重/裁决/验证/投影每一步都要用同一套坐标。
         findings = _collect_findings(reports)
+        slice_start = int(state.get("slice_start") or 0)
+        if slice_start > 0:
+            n_lines = len(str(code).splitlines())
+            findings = [_normalize_slice_location(f, slice_start, n_lines) for f in findings]
         with track_time("dedupe"):
             merged = _deduplicate(findings, session_id, conn, llm)
 

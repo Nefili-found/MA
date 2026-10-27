@@ -68,6 +68,45 @@ def resolve_location(
     return out
 
 
+def normalize_slice_location(
+    finding: Dict[str, Any],
+    offset: int,
+    n_lines: int,
+) -> Dict[str, Any]:
+    """把「原文件绝对行号」归一为「切片内行号」。
+
+    场景：``--file`` 给的是**切片**（例如数据集里 ``..._9090-9393___9290.c_vul.c``，
+    内容只有 304 行），而 A/B/C 常把结论里的行号写成原文件坐标（9290）。
+    9290 在 304 行的代码里取不到任何函数，下游 ``function_at`` 返回 ``None``，
+    ``func_src`` 就切不出来，整个 case 被判 ``invalid_baseline``。
+
+    判定规则刻意保守：**只有行号已经超出切片行数时**才平移——那说明它报的是原文件坐标。
+    行号本来就在切片范围内时一律不动（模型也可能直接报对了，不能把对的改错）。
+
+    平移后仍不合法（例如偏得离谱）则原样返回，交给 ``resolve_location`` 标成 ``llm``，
+    不硬凑一个假行号。
+    """
+    if offset <= 0 or n_lines <= 0:
+        return finding
+    loc = dict(finding.get("location") or {})
+    line = as_int(loc.get("line_start"))
+    if line <= 0 or line <= n_lines:
+        return finding
+
+    shifted = line - offset + 1
+    if not (1 <= shifted <= n_lines):
+        return finding
+
+    end = as_int(loc.get("line_end")) or line
+    shifted_end = end - offset + 1
+    loc["line_start"] = shifted
+    loc["line_end"] = shifted_end if 1 <= shifted_end <= n_lines else shifted
+    loc["slice_shifted_from"] = line
+    out = dict(finding)
+    out["location"] = loc
+    return out
+
+
 def norm_path(raw: Any) -> List[str]:
     """把报告里的传播路径归一为有序节点名列表（丢弃空元素与相邻重复）。"""
     seq: List[str] = []

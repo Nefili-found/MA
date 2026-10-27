@@ -31,6 +31,13 @@ class ScanState(TypedDict, total=False):
     commit: str       # 被扫描文件对应的上游 commit
     rel_file: str     # 仓库相对路径（用于跨机器复现）
 
+    # ---- 行号基准（D5）：切片扫描时行号从切片起算 ----
+    # 注意：这两个键必须在这里声明。LangGraph 按 TypedDict 的 channel 传状态，
+    # 没声明的键在 START → D 之间会被静默丢弃（实测：加进 main.py 的 state 却在
+    # D 里取不到，投影 line_base 一直回落成 file，case 全被判 invalid_baseline）。
+    slice_start: int  # 切片在原文件里的起始行号（1-based）；0 = 完整文件
+    line_base: str    # file | function（function = 行号相对切片起点）
+
     # ---- A/B/C 原始报告：{"A": {...}, "B": {...}, "C": {...}} ----
     reports: Annotated[Dict[str, Any], merge_reports]
 

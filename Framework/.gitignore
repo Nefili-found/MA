@@ -41,3 +41,11 @@ desktop.ini
 # ===== 大体积数据 / 外部副本（不入库，另行管理）=====
 test_data/primevul_raw/
 other fix framework/
+
+# ===== 不随代码上传（非源码：设计文档 / 记录 / 运行产物 / 数据集）=====
+change_process/
+record_to_finish/
+artifacts/
+output/*
+!output/.gitkeep
+test_data/*.jsonl

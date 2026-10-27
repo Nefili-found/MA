@@ -91,7 +91,18 @@ def build(
         index, backend = _make_index(cfg.embed_dim)
         vectors = embedder.encode([r["root_cause"] for r in rows]) if rows else []
         check_vectors(vectors, cfg.embed_dim)
-        index.add([(i, vec) for i, vec in enumerate(vectors)])
+        # faiss 的 IndexFlatL2.add() 只吃 ndarray（内部读 x.shape）；元组列表 (序号, 向量)
+        # 是纯 Python 兜底 FlatL2Index 的入参形状。两条分支必须分开，
+        # 否则装了 faiss 反而崩在 'list' object has no attribute 'shape'。
+        if FAISS_AVAILABLE:  # pragma: no cover - 取决于环境（由 tests/test_kb_store_faiss.py 覆盖）
+            import numpy as np  # 惰性导入：无 faiss 时不引入 numpy 硬依赖
+
+            arr = np.asarray(vectors, dtype="float32")
+            if arr.size == 0:  # 空视图也要给出 (0, dim) 的形状，faiss 不接受一维空数组
+                arr = arr.reshape(0, cfg.embed_dim)
+            index.add(arr)
+        else:
+            index.add([(i, vec) for i, vec in enumerate(vectors)])
         path = out_dir / ("kb_df.faiss" if view == "data_flow" else "kb_cf.faiss")
         if not FAISS_AVAILABLE:
             path = path.with_suffix(".json")

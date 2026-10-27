@@ -1,7 +1,9 @@
 # 知识库建库配置（Phase 1：抽取 / 抽象 / 嵌入 / 存储）
 # 优先级：本文件 < 环境变量 / config/.env
 # 未知键会直接报错（防"开关名写错 → 静默跑默认值"污染消融结果）。
-# 设计依据：change_process/design/知识库_双视图抽取与存储_代码方案_设计.md §6.2
+# 设计依据：`知识库_双视图抽取与存储_代码方案_设计.md` §6.2
+#   该设计稿已归档于仓库根的 `keep（实验剔除文档）/`（不在工作区，见 change_process/README.md §8 索引）
+# 数据源登记与实测口径：change_process/README.md §7
 
 pairs_root: "other fix framework/datasets/patchdb_cvefixes_for_appatch_train"
 out_dir: "artifacts/kb-v1"
@@ -27,7 +29,14 @@ evidence:
   max_cf_items: 20
 
 embed:
-  model: "sentence-transformers/all-MiniLM-L6-v2"
+  # 指向**仓库内**的模型目录，不用 HF 仓库 id。
+  # 原因：huggingface.co 在本机不可达（WinError 10060），而 HF 仓库 id 会先发 HEAD 请求校验
+  # 缓存新鲜度，超时即失败——哪怕权重已在本地。给定文件系统路径时 huggingface_hub 不并发请求，
+  # 完全离线可跑，也不需要 HF_ENDPOINT。
+  # 目录来自 all-MiniLM-L6-v2 的 HF snapshot 1110a243（`_name_or_path` 仍是
+  # sentence-transformers/all-MiniLM-L6-v2），.cache/ 已被 .gitignore 忽略，不入库。
+  # 换模型 = 换目录 + 重跑 build；建库与查询必须同一份权重，否则整库报废（设计稿 §8）。
+  model: ".cache/hf/all-MiniLM-L6-v2"
   dim: 384
   batch: 64
 

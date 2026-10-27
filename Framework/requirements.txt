@@ -14,3 +14,18 @@ python-dotenv>=1.0
 # 保留 tree-sitter-cpp 以维持 C 与 C++ 两种源码支持。
 tree-sitter>=0.25,<0.26
 tree-sitter-cpp>=0.23.4,<0.24
+
+# ===== 知识库建库 / 修复端检索（真向量 + ANN 索引）=====
+# 缺这两个依赖时 kbcore 会**静默降级**：embed 退成 hashing-ngram、索引退成 flat-python，
+# 产出的库带 embed_production=false（向量是哈希、没有语义）。见 change_process/README.md §7。
+# 实测版本：faiss-cpu 1.15.1 / sentence-transformers 6.2.0 / torch 2.14.1 / numpy 2.2.6（Python 3.10）
+faiss-cpu>=1.15
+sentence-transformers>=6.2
+# 模型怎么放：`configs/kb.yaml` 的 `embed.model` 指向**仓库内目录** `.cache/hf/all-MiniLM-L6-v2`，
+# 不写 HF 仓库 id。原因：HF 仓库 id 会先向 huggingface.co 发 HEAD 校验缓存新鲜度，该域名在部分
+# 网络下不可达（实测 WinError 10060），超时即失败——哪怕权重已在本地。给文件系统路径时
+# huggingface_hub 直接读盘，不发请求（实测加载 9.97s、零 WinError）。
+# 该目录是 snapshot 1110a243 的副本（11 文件 / 87.3 MB），`.cache/` 已被 .gitignore 忽略，不入库。
+# 新环境要自行获取：设 HF_ENDPOINT=https://hf-mirror.com（社区镜像）后由
+# SentenceTransformer 拉一次，再把 snapshot 目录复制到 .cache/hf/all-MiniLM-L6-v2。
+# 注意：HF_* 变量写进 config/.env 无效——kbcore 的 .env 解析器只映射配置字段，不导出到 os.environ。

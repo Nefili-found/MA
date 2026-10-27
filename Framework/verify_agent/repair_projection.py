@@ -142,6 +142,10 @@ def build_repair_input(
                     "body_line_start": fn_start,
                     "body_line_end": fn_end,
                     "truncated": False,
+                    # D5：行号基准必须显式声明，否则修复端只能猜。
+                    # ``function`` = 传入的代码是切片、行号从 1 起（``--slice-start`` 生效时）；
+                    # ``file``     = 传入的是真实文件、行号是文件绝对行号。
+                    "line_base": str(state.get("line_base") or "file"),
                     "line_source": str(loc.get("line_source") or "llm"),
                     "function_resolved_by": str(loc.get("function_resolved_by") or "llm"),
                 },

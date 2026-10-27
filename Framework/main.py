@@ -69,6 +69,17 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=None,
         help="真实仓库根目录；给了才能把 --file 转成仓库相对路径（跨机器可复现）",
     )
+    parser.add_argument(
+        "--slice-start",
+        dest="slice_start",
+        type=int,
+        default=0,
+        help=(
+            "被扫描文件是**切片**时，它在原文件里的起始行号（1-based）；"
+            "0 = 传入的是完整文件。给了它，A/B/C 报出的原文件绝对行号会被归一成切片内行号，"
+            "否则 function_at 取不到函数、func_src 为空、case 直接被判 invalid_baseline。"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -103,6 +114,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "repo": args.repo or "",
         "commit": args.commit or "",
         "rel_file": rel_file,
+        # 【D5 行号基准】切片扫描：行号从切片起算；完整文件：行号即文件绝对行号。
+        # 这两个键一路传到 verify_agent/repair_projection.py 的 code.line_base。
+        "slice_start": max(0, int(args.slice_start or 0)),
+        "line_base": "function" if int(args.slice_start or 0) > 0 else "file",
         "reports": {},
         "merged_findings": [],
         "verified_findings": [],
