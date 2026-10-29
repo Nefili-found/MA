@@ -60,6 +60,11 @@ CONF_ACCEPT = 0.90        # 路径逐跳可达且条件均未被反驳
 CONF_BLOCKER_ONLY = 0.55  # 仅命中启发式 blocker（故意低于默认 τ=0.8）
 CONF_CHALLENGE = 0.30     # 存在无法核验的跳 / 条件
 
+#: 【性能优化】守卫扫描窗口：只在 sink 前最近 N 行里找守卫。
+#: 守卫离 sink 超过 150 行时，要么不在同一支配块（块作用域 depths 检查会滤掉），
+#: 要么基本不可能支配 sink。函数体几千行时全窗口扫正则是浪费。
+MAX_GUARD_WINDOW = 150
+
 VERDICT_TO_STATUS = {
     "accept": "verified",
     "reject": "rejected",
@@ -424,8 +429,12 @@ def check_assumptions(
 
     source_lines = (code or "").splitlines()
     if source_lines and fn_start and fn_end:
-        window = source_lines[fn_start - 1 : sink_line]
-        base_line = fn_start
+        # 【性能优化】守卫极少离 sink 超过 150 行（远的守卫基本不支配 sink，
+        # 块作用域 depths[idx] > depths[sink_idx] 也会把它滤掉）。函数体几千行时
+        # 全窗口扫正则是浪费，只保留 sink 前最近 MAX_GUARD_WINDOW 行。
+        start_idx = max(fn_start - 1, sink_line - MAX_GUARD_WINDOW)
+        window = source_lines[start_idx : sink_line]
+        base_line = start_idx + 1
     else:
         # 没有源码文本时退化：用函数体文本，行号以函数起始行为基准
         window = (body.get("body") or "").splitlines()
@@ -520,6 +529,49 @@ def _map_verdict(
     if not reasons:
         reasons.append("证据不足以判定")
     return "challenge", CONF_CHALLENGE, "；".join(reasons)
+
+
+# ---------------------------------------------------------------------------
+# 批量验证（性能优化：同一份 code / 同一个 CallContext 只建一次）
+# ---------------------------------------------------------------------------
+def verify_taint_batch(hypotheses: list, context: dict) -> list:
+    """对同一文件的多条 hypothesis 批量验证。
+
+    原设计是 D 的 tool_loop 对每条 finding 各调一次 ``verify_taint``，
+    每次都走一遍 ``set_active_context``（tree-sitter 重新解析）。
+    本函数在函数体外只解析一次、复用到所有 hypothesis：
+
+    * 单文件 finding 多时（典型 5–20 条），省掉 N-1 次 tree-sitter 解析；
+    * 返回结构与逐条调 ``verify_taint`` 完全一致，按输入顺序对齐。
+
+    :param hypotheses: hypothesis dict 列表。
+    :param context: ``{"file","line_range","code"}``，与 :func:`verify_taint` 同。
+    """
+    context = context or {}
+    code = str(context.get("code") or "")
+
+    # 只建一次 CallContext；若外部已 set_active_context 且 functions 非空，直接复用。
+    cc = active_context()
+    if not cc.functions and code:
+        cc = set_active_context(code)
+
+    results: List[Dict[str, Any]] = []
+    for hyp in hypotheses or []:
+        try:
+            results.append(verify_taint(hyp, context))
+        except Exception as exc:  # 单条失败不拖垮整批
+            results.append({
+                "finding_id": hyp.get("finding_id") if isinstance(hyp, dict) else None,
+                "status": "uncertain",
+                "verdict": "uncertain",
+                "confidence": 0.0,
+                "reason": f"verify_taint 单条异常: {type(exc).__name__}: {exc}",
+                "evidence": {"path": [], "path_status": "unverifiable",
+                             "conditions": [], "blockers": [], "used_tools": []},
+                "tool_name": TOOL_NAME,
+                "raw_output": {"error": str(exc)},
+            })
+    return results
 
 
 # ---------------------------------------------------------------------------
