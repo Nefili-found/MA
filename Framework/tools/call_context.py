@@ -36,6 +36,9 @@
 """
 from __future__ import annotations
 
+from __future__ import annotations
+
+from functools import lru_cache
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 from tree_sitter import Language, Parser
@@ -56,14 +59,19 @@ DEFAULT_MAX_BODY_CHARS = 0  # 0 表示不限制
 # ---------------------------------------------------------------------------
 # tree-sitter 语言加载（失败则整体降级为空上下文）
 # ---------------------------------------------------------------------------
-def _load_language() -> Optional["Language"]:
+# 【性能优化】模块级 _LANGUAGE 改为 lru_cache 懒加载：
+# 原本 import 本模块就触发 language() 原生库加载（~50ms），
+# 降级模式 / 批量跑不做解析时这笔钱纯浪费。首次 build_context/statement_regions 时才加载。
+@lru_cache(maxsize=1)
+def _get_language() -> Optional["Language"]:
     try:
         return Language(tree_sitter_cpp.language())
     except Exception:  # pragma: no cover - 依赖/版本异常
         return None
 
 
-_LANGUAGE = _load_language()
+# 向后兼容：老代码可能直接引用 _LANGUAGE。保留为模块级属性，但不再在 import 时求值。
+_LANGUAGE: Optional["Language"] = None  # type: ignore[assignment]
 
 
 def _iter_descendants(node: Any) -> Iterator[Any]:
@@ -347,11 +355,11 @@ def build_context(code: str) -> CallContext:
     functions: Dict[str, Dict[str, Any]] = {}
     edges: List[Tuple[str, str, int, int]] = []
 
-    if not code or _LANGUAGE is None:
+    if not code or _get_language() is None:
         return CallContext(functions, edges)
 
     try:
-        parser = Parser(_LANGUAGE)
+        parser = Parser(_get_language())
         tree = parser.parse(code.encode("utf-8", "replace"))
         root = tree.root_node
     except Exception:  # pragma: no cover - 解析异常时降级
@@ -418,10 +426,10 @@ def statement_regions(code: str) -> List[Dict[str, Any]]:
     单独导出是为了让「一个文件多条 finding」只解析一次（``statement_at_line``
     内部按源码内容做单条缓存，避免每个 finding 重新解析同一份文件）。
     """
-    if not code or _LANGUAGE is None:
+    if not code or _get_language() is None:
         return []
     try:
-        tree = Parser(_LANGUAGE).parse(code.encode("utf-8", "replace"))
+        tree = Parser(_get_language()).parse(code.encode("utf-8", "replace"))
     except Exception:  # pragma: no cover - 解析异常时降级
         return []
     regions: List[Dict[str, Any]] = []
