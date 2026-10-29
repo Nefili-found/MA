@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -21,6 +22,8 @@ from .config import KBConfig
 from .embed import check_vectors
 from .interfaces import Embedder, RunStats
 from .pipeline import VIEWS, assign_index_rows
+
+logger = logging.getLogger(__name__)
 
 try:  # 可选依赖
     import faiss  # type: ignore
@@ -77,6 +80,20 @@ def build(
     """建两个库并落盘。``records`` 必须已过门禁（gate）。"""
     out_dir = Path(out_dir or cfg.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # 【可观测性】静默降级是最危险的：当前 KB 是 hashing-ngram + flat-python，
+    # 检索结果**没有语义**，但用户从产物上看不出来。启动时明确 warn 一次。
+    if not FAISS_AVAILABLE:
+        logger.warning(
+            "[kbcore] faiss-cpu 未安装 → 索引退化为 flat-python（578 条可用，10w 条会慢）；"
+            "pip install faiss-cpu 以启用真向量 ANN。"
+        )
+    if not bool(getattr(embedder, "production", False)):
+        reason = getattr(embedder, "fallback_reason", None) or "未知"
+        logger.warning(
+            "[kbcore] embedding 未走生产模型 → 向量是 hashing-ngram，**检索结果无语义，勿用于评测**。"
+            "fallback_reason=%s", reason,
+        )
 
     records = sorted(records, key=lambda r: (r["pair_id"], r["view_type"]))
     assign_index_rows(records)
