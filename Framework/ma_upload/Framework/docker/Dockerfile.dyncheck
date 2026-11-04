@@ -1,0 +1,30 @@
+# =============================================================================
+# MA D 阶段动态验证沙箱镜像（AutoSafeCoder 式 fuzzing 执行环境）
+#
+# 构建（在仓库 Framework/ 目录下执行）：
+#   docker build -f docker/Dockerfile.dyncheck -t ma-dyncheck:latest .
+#
+# dynamic_check.py 会自动探测 docker 并把编译/执行都放进这个镜像里：
+#   docker run --rm --network=none -v <workdir>:/work -w /work ma-dyncheck:latest \
+#       gcc -g -O1 -fsanitize=address,undefined harness.c -o harness.bin
+#   docker run --rm --network=none --memory=512m --pids-limit=64 \
+#       -v <workdir>:/work -w /work ma-dyncheck:latest ./harness.bin
+#
+# 安全边界：--network=none 断网；--memory/--pids-limit 防爆；非 root 运行；
+# 崩溃是预期产物（ASan 报告），不是攻击面。
+# =============================================================================
+FROM gcc:13-bookworm
+
+# ASan/UBSan 行为固化到镜像里：
+#   detect_leaks=0      harness 短小、泄漏与目标缺陷无关，关掉减少噪声
+#   abort_on_error=1    一出错立即中止并打报告，不等 main 返回
+#   disable_coredump=1  不生成 core 文件，省磁盘
+#   halt_on_error=1     UBSan 发现未定义行为同样中止
+ENV ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:disable_coredump=1
+ENV UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1
+
+# 非 root 用户跑被测二进制（编译时需要对挂载的 /work 有写权限；
+# Docker Desktop / Linux 挂载卷默认可写，若有权限问题可去掉 USER 行）
+RUN useradd -m runner
+WORKDIR /work
+USER runner
