@@ -22,6 +22,7 @@ from errors import VerifyError
 from observability import log_event
 from tools.call_context import CONTEXT_TOOLS, get_callees, get_callers, get_function_body
 from tools.dynamic_check import dynamic_check, dynamic_check_tool
+from tools.injection_check import injection_check, injection_check_tool
 from tools.verify_taint import verify_taint, verify_taint_tool
 from verify_agent.prompts import load_verify_prompts
 from verify_agent.signals import parse_llm_verdict
@@ -78,6 +79,8 @@ def available_tools() -> List[Any]:
         tools.append(verify_taint_tool)
     if dynamic_check_tool is not None:
         tools.append(dynamic_check_tool)
+    if injection_check_tool is not None:
+        tools.append(injection_check_tool)
     tools.extend(t for t in CONTEXT_TOOLS if t is not None)
     return tools
 
@@ -111,6 +114,13 @@ def dispatch_tool(
         result = dynamic_check(h, c)
         finding_id = h.get("finding_id", "") if isinstance(h, dict) else ""
         return result, {"tool": "dynamic_check", "args": {"finding_id": finding_id}}
+
+    if name == "injection_check":
+        h = args.get("hypothesis", hypothesis)
+        c = args.get("context", context)
+        result = injection_check(h, c)
+        finding_id = h.get("finding_id", "") if isinstance(h, dict) else ""
+        return result, {"tool": "injection_check", "args": {"finding_id": finding_id}}
 
     if name in ("get_callers", "get_callees", "get_function_body"):
         impl = {

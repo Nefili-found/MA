@@ -33,6 +33,12 @@ verify:
   dynamic:
     enabled: true
     note: "无 gcc/clang 时自动降级；生产环境建议挂 Docker 镜像运行"
+  # 注入类源码核验（78 命令注入 / 89 SQL 注入 / 79 XSS）：
+  # 源码层核验 sink 命中 + 外部输入直达 + 有无参数化/转义/白名单；
+  # 静态证据 accept 0.88，永不判 reject。开关由环境变量控制：INJCHECK_ENABLED=0 关闭。
+  injection:
+    enabled: true
+    note: "静态源码特征核验；真实执行复现需 shell/DB/浏览器环境，后续按需扩展"
 
 logging:
   enabled: true

@@ -18,6 +18,7 @@ from typing import Any, Dict, Optional
 from agents import parse_json_object
 from observability import log_event
 from tools.dynamic_check import CONF_DYNAMIC_CRASH, dynamic_check
+from tools.injection_check import CONF_INJECTION_EVIDENCE, injection_check
 from tools.verify_taint import VERDICT_TO_STATUS, verify_taint
 
 
@@ -69,6 +70,21 @@ def tool_signal(hypothesis: Dict[str, Any], context: Dict[str, Any]) -> Dict[str
             tool_sig["verdict"] = "accept"
             tool_sig["confidence"] = max(tool_sig["confidence"], CONF_DYNAMIC_CRASH)
             tool_sig["reason"] += "；动态证据：" + str(dyn.get("reason") or "")
+    # 注入类源码核验（78/89/79）：同样只补强、从不削弱。
+    # * 源码命中 sink + 直达 + 无安全写法 → accept（静态证据 0.88）；
+    # * 守卫存疑 / 来源不明 → 只附证据，不改判。
+    try:
+        inj = injection_check(hypothesis, context)
+    except Exception as exc:  # 注入工具异常绝不影响静态信号
+        log_event("verify.injection_signal_failed", level="warn",
+                  error=f"{type(exc).__name__}: {exc}")
+        inj = None
+    if isinstance(inj, dict):
+        tool_sig["evidence"]["injection"] = inj.get("evidence") or {}
+        if str(inj.get("verdict") or "") == "accept":
+            tool_sig["verdict"] = "accept"
+            tool_sig["confidence"] = max(tool_sig["confidence"], CONF_INJECTION_EVIDENCE)
+            tool_sig["reason"] += "；注入证据：" + str(inj.get("reason") or "")
     return tool_sig
 
 
