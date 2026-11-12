@@ -17,6 +17,7 @@ from typing import Any, Dict, Optional
 
 from agents import parse_json_object
 from observability import log_event
+from tools.dynamic_check import CONF_DYNAMIC_CRASH, dynamic_check
 from tools.verify_taint import VERDICT_TO_STATUS, verify_taint
 
 
@@ -47,12 +48,28 @@ def tool_signal(hypothesis: Dict[str, Any], context: Dict[str, Any]) -> Dict[str
         confidence = float(result.get("confidence") or 0.0)
     except (TypeError, ValueError):
         confidence = 0.0
-    return {
+    tool_sig = {
         "verdict": str(result.get("verdict") or "uncertain").strip().lower(),
         "confidence": confidence,
         "reason": str(result.get("reason") or ""),
         "evidence": result.get("evidence") or {},
     }
+    # 【第二阶段】动态验证（AutoSafeCoder 式 fuzzing）：只补强、从不削弱。
+    # * 跑出运行时崩溃 → 提升为 accept（硬证据 0.92，≥ tau，可定案）；
+    # * 跳过 / 未崩 → 只附证据，不改判（没崩 ≠ 没漏洞，绝不 reject）。
+    try:
+        dyn = dynamic_check(hypothesis, context)
+    except Exception as exc:  # 动态工具异常绝不影响静态信号
+        log_event("verify.dynamic_signal_failed", level="warn",
+                  error=f"{type(exc).__name__}: {exc}")
+        dyn = None
+    if isinstance(dyn, dict):
+        tool_sig["evidence"]["dynamic"] = dyn.get("evidence") or {}
+        if str(dyn.get("verdict") or "") == "accept":
+            tool_sig["verdict"] = "accept"
+            tool_sig["confidence"] = max(tool_sig["confidence"], CONF_DYNAMIC_CRASH)
+            tool_sig["reason"] += "；动态证据：" + str(dyn.get("reason") or "")
+    return tool_sig
 
 
 def combine(

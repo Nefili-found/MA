@@ -25,6 +25,14 @@ retries:
 verify:
   tau: 0.8                  # 工具信号单方 overturn 的置信度阈值（blocker 命中封顶 0.55，不会过线）
   drop_rejected: true       # overturn 的 finding 是否从最终输出剔除（false = 只打标不丢）
+  # 动态验证（第二阶段，AutoSafeCoder 式 fuzzing 证据）：只对内存类 CWE、
+  # 沙箱内 gcc/clang 执行、只产出"有罪证据"（崩溃=accept 0.92），永不判 reject。
+  # 未装编译器时自动跳过；以下行为由环境变量控制（无需改代码）：
+  #   DYNCHECK_ENABLED=0  全局关闭    DYNCHECK_MAX_ITER=24  变异轮数
+  #   DYNCHECK_TIMEOUT=5  单进程超时秒数
+  dynamic:
+    enabled: true
+    note: "无 gcc/clang 时自动降级；生产环境建议挂 Docker 镜像运行"
 
 logging:
   enabled: true

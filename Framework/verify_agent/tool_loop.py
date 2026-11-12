@@ -21,6 +21,7 @@ from context import ContextManager
 from errors import VerifyError
 from observability import log_event
 from tools.call_context import CONTEXT_TOOLS, get_callees, get_callers, get_function_body
+from tools.dynamic_check import dynamic_check, dynamic_check_tool
 from tools.verify_taint import verify_taint, verify_taint_tool
 from verify_agent.prompts import load_verify_prompts
 from verify_agent.signals import parse_llm_verdict
@@ -71,10 +72,12 @@ def build_model_payload(
 
 
 def available_tools() -> List[Any]:
-    """可绑定的工具集合：verify_taint + 上下文工具（缺失的自动跳过）。"""
+    """可绑定的工具集合：verify_taint + dynamic_check + 上下文工具（缺失的自动跳过）。"""
     tools: List[Any] = []
     if verify_taint_tool is not None:
         tools.append(verify_taint_tool)
+    if dynamic_check_tool is not None:
+        tools.append(dynamic_check_tool)
     tools.extend(t for t in CONTEXT_TOOLS if t is not None)
     return tools
 
@@ -101,6 +104,13 @@ def dispatch_tool(
         # 只记紧凑标识：完整 hypothesis/context 已分别落 hypothesis_json，避免冗余与循环引用
         finding_id = h.get("finding_id", "") if isinstance(h, dict) else ""
         return result, {"tool": "verify_taint", "args": {"finding_id": finding_id}}
+
+    if name == "dynamic_check":
+        h = args.get("hypothesis", hypothesis)
+        c = args.get("context", context)
+        result = dynamic_check(h, c)
+        finding_id = h.get("finding_id", "") if isinstance(h, dict) else ""
+        return result, {"tool": "dynamic_check", "args": {"finding_id": finding_id}}
 
     if name in ("get_callers", "get_callees", "get_function_body"):
         impl = {
