@@ -22,7 +22,8 @@ import re
 import shutil
 import subprocess
 import tempfile
-from typing import Any, Dict, List, Optional, Tuple
+import time
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from observability import log_event
 
@@ -57,6 +58,11 @@ MEMORY_CWES = frozenset({
 
 #: 单次运行超时秒数（AutoSafeCoder 取 6s；这里取 5s 更保守）
 RUN_TIMEOUT = float(os.environ.get("DYNCHECK_TIMEOUT", "5"))
+#: 单条 finding 全部种子的运行总预算秒数（逐进程跑，防止极端情况超时堆积）
+TOTAL_TIMEOUT = float(os.environ.get("DYNCHECK_TOTAL_TIMEOUT", "60"))
+#: 覆盖率反馈开关：开启时编译带 --coverage，按覆盖增量排序并生成邻域变异第二轮；
+#: 默认关闭，避免影响现有 ASan 路径。反馈闭环需在有工具链的环境调通。
+COVERAGE_ENABLED = os.environ.get("DYNCHECK_COVERAGE", "0") not in ("0", "false", "False")
 #: 变异输入轮数上限（AutoSafeCoder 跑 150 轮；单 finding 静态先行，这里取小值控成本）
 MAX_ITERATIONS = int(os.environ.get("DYNCHECK_MAX_ITER", "24"))
 #: 全局开关：显式关闭时直接跳过（默认开启，由工具链存在性自动兜底）
@@ -131,43 +137,101 @@ def _split_params(params: str) -> List[str]:
     return [p.strip() for p in params.split(",") if p.strip()]
 
 
-def _param_kind(p: str) -> str:
-    """参数分类：ptr / int / other。用于生成危险种子。"""
+#: 缓冲区 / 字符串类参数名关键词（用于把指针参数识别为可传串的 buffer）
+_BUF_NAME_RE = re.compile(
+    r"buf|buffer|str|string|name|msg|data|dst|src|dest|path|cmd|sql|payload|ptr",
+    re.IGNORECASE,
+)
+#: 长度 / 尺寸类参数名关键词（与缓冲区配对做越界联动）
+_LEN_NAME_RE = re.compile(r"(?:^|_)(?:len|length|size|count|num|cnt|n)$", re.IGNORECASE)
+_IDENT_RE = re.compile(r"[A-Za-z_]\w*")
+
+#: 字符串危险种子：空串 / 单字符 / 超长串 / 格式串
+_STR_SEEDS = ['""', '"A"', '"' + "A" * 64 + '"', '"%n%n%s"']
+#: malloc 异常尺寸（异常小 / 异常大缓冲区）
+_MALLOC_SIZES = ["0", "1", "4", "256", "4096"]
+#: 长度 / 整数种子
+_INT_SEEDS = ["-1", "0", "1", "4096", "0x7fffffff"]
+
+
+def _param_name(p: str) -> str:
+    """从参数声明里取参数名（最后一个标识符，去掉 const / 指针符号）。"""
+    toks = _IDENT_RE.findall(p.replace("const", " "))
+    return toks[-1] if toks else ""
+
+
+def _param_role(p: str) -> str:
+    """参数角色：buffer / ptr / length / int / other。
+
+    * ``buffer`` —— 指针且名字像缓冲区/串，可传串字面量或 malloc 缓冲；
+    * ``ptr``    —— 其他指针，只给 malloc 缓冲；
+    * ``length`` —— 整数且名字像长度/尺寸，与缓冲区做越界联动；
+    * ``int``    —— 其他整数；
+    * ``other``  —— 结构体 / 枚举等，给 0/NULL。
+    """
     pn = p.replace("const", "").strip()
+    name = _param_name(p)
     if "*" in pn:
-        return "ptr"
+        return "buffer" if _BUF_NAME_RE.search(name) else "ptr"
     if re.search(r"\b(int|long|short|size_t|unsigned|uint|intptr_t|ssize_t)\b", pn):
-        return "int"
+        return "length" if _LEN_NAME_RE.search(name) else "int"
     return "other"
 
 
 def _gen_calls(func_name: str, params: List[str]) -> List[str]:
     """为被测函数生成类型感知变异的调用语句列表。
 
-    AutoSafeCoder 的 type-aware mutation 移植：int 类给 0/-1/极大值；
-    指针类给 malloc 出的异常尺寸缓冲区；other（struct/枚举）给 0/NULL。
-    """
-    kinds = [_param_kind(p) for p in params]
-    calls: List[str] = []
-    int_seeds = ["0", "-1", "1", "0x7fffffff", "0x10000", "-123456"]
-    buf_seeds = ["0", "1", "4", "256", "4096"]  # 异常小/异常大缓冲区
+    种子策略（按风险优先级排序，超出 ``MAX_ITERATIONS`` 截断）：
 
-    def build(buf_size: str, int_val: str) -> str:
+    1. **越界联动**：buffer + length 同时存在时，小缓冲配大长度 / 负长度；
+    2. **malloc 缓冲**：异常尺寸缓冲区配长度 / 整数种子；
+    3. **串字面量**：空串 / 单字符 / 超长串 / 格式串直传 buffer；
+    4. **兜底**：无指针参数时只喂整数 / 0。
+    """
+    roles = [_param_role(p) for p in params]
+    has_buffer = any(r == "buffer" for r in roles)
+    has_length = any(r == "length" for r in roles)
+    calls: List[str] = []
+
+    def args_for(malloc_size: str, str_literal: Optional[str], int_val: str) -> List[str]:
         args: List[str] = []
-        for k in kinds:
-            if k == "ptr":
-                args.append(f"(char*)malloc({buf_size})")
-            elif k == "int":
+        for r in roles:
+            if r == "buffer":
+                args.append(str_literal if str_literal is not None
+                            else f"(char*)malloc({malloc_size})")
+            elif r == "ptr":
+                args.append(f"(char*)malloc({malloc_size})")
+            elif r in ("length", "int"):
                 args.append(int_val)
             else:
                 args.append("0")
-        return f"{func_name}({', '.join(args)});"
+        return args
 
-    # 种子 1：经典危险组合（小缓冲区 + 负长度）
-    for b in buf_seeds:
-        for iv in ("-1", "0", "0x7fffffff"):
-            calls.append(build(b, iv))
-    # 去重保序
+    def build(malloc_size: str, str_literal: Optional[str], int_val: str) -> str:
+        return f"{func_name}({', '.join(args_for(malloc_size, str_literal, int_val))});"
+
+    # 1) 越界联动：小缓冲 + 大长度 / 负长度（最高风险，优先入列）
+    if has_buffer and has_length:
+        for size in ("1", "4"):
+            for iv in ("4096", "0x7fffffff", "-1"):
+                calls.append(build(size, None, iv))
+
+    # 2) 串字面量直传 buffer（排在 malloc 矩阵前，避免被上限截断挤出）
+    if has_buffer:
+        for seed in _STR_SEEDS:
+            calls.append(build("0", seed, "0"))
+
+    # 3) malloc 异常尺寸缓冲 + 长度 / 整数种子
+    for size in _MALLOC_SIZES:
+        for iv in _INT_SEEDS:
+            calls.append(build(size, None, iv))
+
+    # 4) 无指针参数：纯整数 / 0 兜底
+    if not any(r in ("buffer", "ptr") for r in roles):
+        for iv in _INT_SEEDS:
+            calls.append(build("0", None, iv))
+
+    # 去重保序，按上限截断控成本
     seen = set()
     uniq: List[str] = []
     for c in calls:
@@ -200,19 +264,291 @@ def _extract_function(code: str, func_name: str) -> Optional[str]:
     return None
 
 
-def _harness(func_src: str, func_name: str, calls: List[str]) -> str:
-    """把被测函数包进带 main 的可运行 C。"""
-    call_body = "\n    ".join(calls)
-    return (
-        "#include <stdlib.h>\n"
-        "#include <string.h>\n"
-        "#include <stdio.h>\n"
-        f"{func_src}\n"
-        "int main(void) {\n"
-        f"    {call_body}\n"
-        "    return 0;\n"
-        "}\n"
-    )
+def _all_functions(code: str) -> Dict[str, str]:
+    """正则提取全文所有顶层函数定义：``{函数名: 完整源码}``。"""
+    result: Dict[str, str] = {}
+    for m in _FUNC_RE.finditer(code):
+        name = m.group("name")
+        brace_start = code.find("{", m.end() - 1)
+        if brace_start < 0:
+            continue
+        depth = 0
+        end: Optional[int] = None
+        for i in range(brace_start, len(code)):
+            if code[i] == "{":
+                depth += 1
+            elif code[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+        if end is not None:
+            result[name] = code[m.start():end]
+    return result
+
+
+#: struct / enum 定义块（括号配平截取，吞掉块尾可选分号）
+_TYPE_BLOCK_RE = re.compile(r"\b(?:struct|enum)\b[^{;]*\{", re.S)
+#: 单行 typedef 声明
+_TYPEDEF_RE = re.compile(r"typedef\s+[^;{}]+;", re.S)
+
+
+def _extract_type_definitions(code: str) -> List[str]:
+    """提取源码中的 struct / enum / typedef 定义，供 harness 编译通过。"""
+    defs: List[str] = []
+    for m in _TYPE_BLOCK_RE.finditer(code):
+        brace = code.find("{", m.start())
+        if brace < 0:
+            continue
+        depth = 0
+        end: Optional[int] = None
+        for i in range(brace, len(code)):
+            if code[i] == "{":
+                depth += 1
+            elif code[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+        if end is None:
+            continue
+        if end < len(code) and code[end] == ";":
+            end += 1
+        defs.append(code[m.start():end].strip())
+    for m in _TYPEDEF_RE.finditer(code):
+        defs.append(m.group(0).strip())
+    # 去重保序
+    seen = set()
+    uniq: List[str] = []
+    for d in defs:
+        if d not in seen:
+            seen.add(d)
+            uniq.append(d)
+    return uniq
+
+
+def _collect_dep_sources(
+    code: str, func_name: str, func_src: str
+) -> Tuple[List[str], List[str], str]:
+    """收集被测函数闭包依赖的同文件函数。
+
+    :return: ``(依赖函数名列表, 依赖函数源码列表, 解析数据源)``；
+        数据源为 ``tree-sitter``（CallContext 沿 callees BFS）或 ``regex``（回退）。
+
+    说明：只纳入**同文件**定义的函数；外部库 / 跨文件符号不在 harness 内
+    补桩，编译失败仍按现有口径降级 uncertain（自动 stub 可能掩盖真问题）。
+    """
+    all_funcs = _all_functions(code)
+    dep_names: List[str] = []
+    source = "regex"
+
+    # 优先走 tree-sitter 调用图；原生模块缺失 / 解析失败时落到正则回退。
+    try:
+        from tools.call_context import build_context
+
+        ctx = build_context(code)
+        if ctx.functions:
+            source = "tree-sitter"
+            seen = {func_name}
+            queue = [func_name]
+            while queue:
+                cur = queue.pop(0)
+                for c in ctx.callees(cur).get("callees", []):
+                    callee = c.get("callee", "")
+                    if c.get("defined_in_file") and callee and callee not in seen:
+                        seen.add(callee)
+                        dep_names.append(callee)
+                        queue.append(callee)
+    except Exception:
+        source = "regex"
+        dep_names = []
+
+    if not dep_names:
+        # 正则回退：被测函数体内出现的调用标识符，命中同文件函数表即纳入。
+        for ident in _IDENT_RE.findall(func_src):
+            if ident in all_funcs and ident != func_name and ident not in dep_names:
+                dep_names.append(ident)
+
+    dep_srcs = [all_funcs[n] for n in dep_names if n in all_funcs]
+    return dep_names, dep_srcs, source
+
+
+# ---------------------------------------------------------------------------
+# 覆盖率反馈（框架；真实闭环需在有工具链的环境调通）
+# ---------------------------------------------------------------------------
+def _coverage_flags() -> List[str]:
+    """覆盖率编译/链接选项；开关关闭时返回空列表。"""
+    return ["--coverage"] if COVERAGE_ENABLED else []
+
+
+def _coverage_signature(workdir: str) -> Optional[frozenset]:
+    """读取 gcov 覆盖产物（.gcda）汇总为粗粒度覆盖签名；无产物返回 None。
+
+    注意：当前只按产物文件名 + 大小汇总，不是行级覆盖；行级增量需后续接
+    gcov / llvm-cov 解析。无编译环境时返回 None，种子排序退回原序。
+    """
+    sig: set = set()
+    try:
+        names = os.listdir(workdir)
+    except OSError:
+        return None
+    for name in names:
+        if name.endswith(".gcda"):
+            try:
+                sig.add((name, os.path.getsize(os.path.join(workdir, name))))
+            except OSError:
+                sig.add((name, 0))
+    return frozenset(sig) if sig else None
+
+
+def _rank_by_coverage(
+    calls: List[str], signatures: Dict[int, Optional[frozenset]]
+) -> Tuple[List[str], List[Tuple[int, int]]]:
+    """按覆盖增量给种子排序（新增覆盖多的排前）。
+
+    :return: ``(排序后的 calls, [(新增覆盖量, 原索引), ...])``；
+        无覆盖数据时原样返回，增益全记 0。
+    """
+    if not COVERAGE_ENABLED or not signatures:
+        return list(calls), [(0, i) for i in range(len(calls))]
+    covered: set = set()
+    gains: List[Tuple[int, int]] = []
+    for i, _ in enumerate(calls):
+        sig = signatures.get(i)
+        gain = len(sig - covered) if sig is not None else 0
+        if sig is not None:
+            covered |= sig
+        gains.append((gain, i))
+    order = [calls[i] for _, i in sorted(gains, key=lambda x: -x[0])]
+    return order, gains
+
+
+#: 邻域变异：串字面量截断正则
+_STRING_LITERAL_RE = re.compile(r'"([^"]*)"')
+_NUMERIC_RE = re.compile(r"0x[0-9a-fA-F]+|-?\d+")
+
+
+def _neighbor_mutate(call: str) -> List[str]:
+    """围绕一个种子做粗粒度邻域变异（文本级），返回 1~2 个新调用。
+
+    说明：这是文本扰动，非结构化参数变异；作为覆盖率反馈第二轮的候选，
+    真实方向应由覆盖引导。无工具链环境不会被执行。
+    """
+    variants: List[str] = []
+    nums = _NUMERIC_RE.findall(call)
+    if nums:
+        target = nums[-1]
+        for v in ("0", "2048"):
+            variants.append(call.replace(target, v, 1))
+
+    def _trim(m: re.Match) -> str:
+        s = m.group(1)
+        return '"' + s[: len(s) // 2] + '"' if len(s) > 8 else m.group(0)
+
+    trimmed = _STRING_LITERAL_RE.sub(_trim, call)
+    if trimmed != call:
+        variants.append(trimmed)
+
+    out: List[str] = []
+    for v in variants:
+        if v != call and v not in out:
+            out.append(v)
+    return out[:2]
+
+
+def _minimize_call(
+    call: str,
+    replay: Optional[Callable[[str], bool]] = None,
+) -> Tuple[str, Dict[str, Any]]:
+    """崩溃输入参数级最小化。
+
+    :param call: 触发崩溃的种子调用语句；
+    :param replay: 重放回调，``replay(call) -> bool`` 表示缩减后仍复现崩溃；
+        不可用（无工具链）时传 ``None``，原样返回不缩减。
+    :return: ``(最小化后的 call, 缩减记录)``。
+
+    缩减顺序：长度/整数向 0/1 收缩 → malloc 尺寸收缩到 1 → 串字面量减半；
+    每一步只有 replay 仍返回 True 才保留。串截断为单次减半，完整二分留待后续。
+    """
+    record: Dict[str, Any] = {"minimized": False, "steps": []}
+    if replay is None:
+        return call, record
+
+    current = call
+
+    # 1) 数值参数：大值 → 0 / 1（逐个尝试，保留仍崩的最简值）
+    for num in _NUMERIC_RE.findall(current):
+        if num in ("0", "1", "-1"):
+            continue
+        for cand in ("0", "1"):
+            trial = current.replace(num, cand, 1)
+            if replay(trial):
+                current = trial
+                record["steps"].append(f"num {num}->{cand}")
+                break
+
+    # 2) malloc 尺寸收缩到 1
+    def _malloc_shrink(m: re.Match) -> str:
+        if m.group(1) in ("0", "1"):
+            return m.group(0)
+        trial = current.replace(m.group(0), "malloc(1)", 1)
+        return "malloc(1)" if replay(trial) else m.group(0)
+
+    current = re.sub(r"malloc\((\d+)\)", _malloc_shrink, current)
+
+    # 3) 串字面量减半（单次；完整二分截断留待后续）
+    def _str_half(m: re.Match) -> str:
+        s = m.group(1)
+        if len(s) <= 1:
+            return m.group(0)
+        half = s[: len(s) // 2]
+        trial = current.replace(m.group(0), f'"{half}"', 1)
+        return f'"{half}"' if replay(trial) else m.group(0)
+
+    current = _STRING_LITERAL_RE.sub(_str_half, current)
+
+    record["minimized"] = current != call
+    return current, record
+
+
+def _harness(
+    type_defs: List[str],
+    dep_srcs: List[str],
+    func_src: str,
+    calls: List[str],
+) -> str:
+    """把类型定义、依赖函数、被测函数包进可运行 C。
+
+    每个变异种子包成独立的 ``seed_i`` 函数，``main`` 按 ``argv[1]`` 选择执行哪一个；
+    编译只做一次，运行时逐种子起独立进程，崩溃即可定位到具体种子索引。
+    """
+    parts: List[str] = [
+        "#include <stdlib.h>",
+        "#include <string.h>",
+        "#include <stdio.h>",
+        "",
+    ]
+    if type_defs:
+        parts.extend(type_defs)
+        parts.append("")
+    if dep_srcs:
+        parts.extend(dep_srcs)
+        parts.append("")
+    parts.append(func_src)
+    parts.append("")
+    for i, call in enumerate(calls):
+        parts.append(f"static void seed_{i}(void) {{ {call} }}")
+    parts.append("")
+    parts.append("int main(int argc, char **argv) {")
+    parts.append("    int idx = argc > 1 ? atoi(argv[1]) : 0;")
+    parts.append("    switch (idx) {")
+    for i in range(len(calls)):
+        parts.append(f"        case {i}: seed_{i}(); break;")
+    parts.append("        default: break;")
+    parts.append("    }")
+    parts.append("    return 0;")
+    parts.append("}")
+    return "\n".join(parts)
 
 
 def _skip(reason: str, finding_id: str = "", **extra: Any) -> Dict[str, Any]:
@@ -233,11 +569,17 @@ def _skip(reason: str, finding_id: str = "", **extra: Any) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # 对外入口
 # ---------------------------------------------------------------------------
-def dynamic_check(hypothesis: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+def dynamic_check(
+    hypothesis: Dict[str, Any],
+    context: Dict[str, Any],
+    enabled: Optional[bool] = None,
+) -> Dict[str, Any]:
     """对一条 finding 做动态验证，返回与 verify_taint 同构的结果。
 
     :param hypothesis: ``{finding_id, title, cwe, location:{function}, ...}``
     :param context:    ``{file, line_range, code}``
+    :param enabled:    应用层开关；``None`` 时回退模块级 ``ENABLED``（环境变量
+                       ``DYNCHECK_ENABLED``），显式 ``False`` 直接跳过，不触发编译/运行。
 
     判出口径：
 
@@ -250,8 +592,9 @@ def dynamic_check(hypothesis: Dict[str, Any], context: Dict[str, Any]) -> Dict[s
     context = context or {}
     finding_id = str(hypothesis.get("finding_id") or "")
 
-    if not ENABLED:
-        return _skip("DYNCHECK_ENABLED=0", finding_id)
+    flag = ENABLED if enabled is None else bool(enabled)
+    if not flag:
+        return _skip("动态验证已关闭（verify.dynamic.enabled=false）", finding_id)
     if not _is_memory_cwe(hypothesis):
         return _skip(
             f"CWE {_norm_cwe(hypothesis.get('cwe')) or '?'} 非内存类，动态验证不适用",
@@ -286,79 +629,155 @@ def dynamic_check(hypothesis: Dict[str, Any], context: Dict[str, Any]) -> Dict[s
     if not calls:
         return _skip(f"{func_name} 参数形态无法生成种子", finding_id)
 
+    # harness 依赖补齐：同文件被调函数闭包 + 类型定义纳入编译单元；
+    # 外部 / 跨文件符号不补桩，编译失败仍按 uncertain 降级。
+    type_defs = _extract_type_definitions(code)
+    dep_names, dep_srcs, dep_source = _collect_dep_sources(code, func_name, func_src)
+
     workdir = tempfile.mkdtemp(prefix="dyncheck_")
     harness_path = os.path.join(workdir, "harness.c")
     bin_path = os.path.join(workdir, "harness.bin")
     try:
         with open(harness_path, "w", encoding="utf-8") as f:
-            f.write(_harness(func_src, func_name, calls))
+            f.write(_harness(type_defs, dep_srcs, func_src, calls))
 
         def _compile() -> Tuple[int, str]:
             """编译 harness（docker 模式在容器内完成）。返回 (returncode, stderr)。"""
+            cov = _coverage_flags()
             if use_docker:
                 mount = _win_mount(workdir)
                 cmd = ["docker", "run", "--rm", "--network=none",
                        "-v", f"{mount}:/work", "-w", "/work",
-                       DOCKER_IMAGE, "gcc", "-g", "-O1",
+                       DOCKER_IMAGE, "gcc", "-g", "-O1", *cov,
                        "-fsanitize=address,undefined", "harness.c", "-o", "harness.bin"]
             else:
-                cmd = [compiler, "-g", "-O1",
+                cmd = [compiler, "-g", "-O1", *cov,
                        "-fsanitize=address,undefined", harness_path, "-o", bin_path]
             cp = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
             return cp.returncode, (cp.stderr or "")
 
-        def _run() -> Tuple[int, str]:
-            """跑一次 harness（main 内含全部变异种子）。返回 (returncode, blob)。"""
+        def _run(idx: int) -> Tuple[int, str]:
+            """跑指定索引的种子（独立进程）。返回 (returncode, blob)。"""
+            seed_arg = str(idx)
             if use_docker:
                 mount = _win_mount(workdir)
                 cmd = ["docker", "run", "--rm", "--network=none",
                        "--memory=512m", "--pids-limit=64",
                        "-v", f"{mount}:/work", "-w", "/work",
-                       DOCKER_IMAGE, "./harness.bin"]
+                       DOCKER_IMAGE, "./harness.bin", seed_arg]
             else:
-                cmd = [bin_path]
+                cmd = [bin_path, seed_arg]
             rp = subprocess.run(cmd, capture_output=True, text=True,
                                 timeout=RUN_TIMEOUT + 10)
             return rp.returncode, (rp.stderr or "") + (rp.stdout or "")
+
+        def _replay_single(call: str) -> bool:
+            """重放单条调用是否仍崩溃；编译/运行失败一律按未复现处理（False）。"""
+            replay_dir = tempfile.mkdtemp(prefix="dynreplay_")
+            try:
+                rp = os.path.join(replay_dir, "r.c")
+                rb = os.path.join(replay_dir, "r.bin")
+                with open(rp, "w", encoding="utf-8") as f:
+                    f.write(_harness([], dep_srcs, func_src, [call]))
+                if use_docker:
+                    mount = _win_mount(replay_dir)
+                    c_compile = ["docker", "run", "--rm", "--network=none",
+                                 "-v", f"{mount}:/work", "-w", "/work",
+                                 DOCKER_IMAGE, "gcc", "-g", "-O1",
+                                 "-fsanitize=address,undefined", "r.c", "-o", "r.bin"]
+                    c_run = ["docker", "run", "--rm", "--network=none",
+                             "--memory=256m", "--pids-limit=32",
+                             "-v", f"{mount}:/work", "-w", "/work",
+                             DOCKER_IMAGE, "./r.bin", "0"]
+                else:
+                    c_compile = [compiler, "-g", "-O1",
+                                 "-fsanitize=address,undefined", rp, "-o", rb]
+                    c_run = [rb, "0"]
+                cp = subprocess.run(c_compile, capture_output=True, text=True, timeout=60)
+                if cp.returncode != 0:
+                    return False
+                rp_run = subprocess.run(c_run, capture_output=True, text=True,
+                                        timeout=RUN_TIMEOUT + 10)
+                blob = (rp_run.stderr or "") + (rp_run.stdout or "")
+                return rp_run.returncode != 0 or any(mk in blob for mk in _CRASH_MARKS)
+            except Exception:
+                return False
 
         rc, stderr = _compile()
         if rc != 0:
             log_event("dynamic_check.compile_failed", finding_id=finding_id)
             return _skip("harness 编译失败（被测函数可能依赖外部符号）",
-                         finding_id, compile_stderr_tail=stderr[-600:])
+                         finding_id, compile_stderr_tail=stderr[-600:],
+                         dependency_functions=dep_names)
 
-        # 跑一次：任一变异种子崩溃即定案（崩溃日志定位出错参数）
-        rc, blob = _run()
-        if rc != 0 or any(mark in blob for mark in _CRASH_MARKS):
-            mark = next((mk for mk in _CRASH_MARKS if mk in blob), "crash")
+        # 逐种子起独立进程：任一崩溃即定案，并定位到具体种子索引；
+        # 单种子超时不计崩溃，继续下一个；总预算耗尽则停止剩余种子。
+        deadline = time.monotonic() + TOTAL_TIMEOUT
+        crash_idx: Optional[int] = None
+        crash_call = ""
+        crash_mark = "crash"
+        crash_blob = ""
+        seeds_ran = 0
+        signatures: Dict[int, Optional[frozenset]] = {}
+        for i, call in enumerate(calls):
+            if time.monotonic() >= deadline:
+                log_event("dynamic_check.budget_exhausted",
+                          finding_id=finding_id, seeds_ran=seeds_ran,
+                          seed_total=len(calls))
+                break
+            try:
+                rc, blob = _run(i)
+            except subprocess.TimeoutExpired:
+                # 该种子超时：不作为崩溃证据，继续尝试后续种子
+                continue
+            seeds_ran += 1
+            signatures[i] = _coverage_signature(workdir)
+            if rc != 0 or any(mark in blob for mark in _CRASH_MARKS):
+                crash_mark = next((mk for mk in _CRASH_MARKS if mk in blob), "crash")
+                crash_idx, crash_call, crash_blob = i, call, blob
+                break
+
+        if crash_idx is not None:
+            min_call, min_record = _minimize_call(crash_call, replay=_replay_single)
             return {
                 "status": "verified",
                 "verdict": "accept",
                 "confidence": CONF_DYNAMIC_CRASH,
                 "reason": (
-                    f"动态执行复现运行时错误（{mark}），"
-                    f"共喂入 {len(calls)} 个变异种子"
+                    f"动态执行复现运行时错误（{crash_mark}，"
+                    f"种子 #{crash_idx + 1}/{len(calls)}）"
                 ),
                 "evidence": {
                     "crash": True,
-                    "crash_type": mark,
-                    "trigger_calls": calls,
+                    "crash_type": crash_mark,
+                    "trigger_call": min_call,
+                    "trigger_calls": [min_call],
+                    "minimization": min_record,
+                    "seed_index": crash_idx,
                     "seed_count": len(calls),
-                    "sanitizer_log_tail": blob[-800:],
+                    "seeds_ran": seeds_ran,
+                    "coverage_enabled": COVERAGE_ENABLED,
+                    "dependency_functions": dep_names,
+                    "dependency_source": dep_source,
+                    "type_definition_count": len(type_defs),
+                    "sanitizer_log_tail": crash_blob[-800:],
                     "backend": f"docker:{DOCKER_IMAGE}" if use_docker else str(compiler),
                 },
                 "tool_name": TOOL_NAME,
-                "raw_output": {"finding_id": finding_id, "exit_code": rc},
+                "raw_output": {"finding_id": finding_id, "exit_code": rc,
+                               "seed_index": crash_idx},
             }
 
-        # 全部跑通：fuzz 未覆盖到 ≠ 无漏洞
+        # 全部跑通（或预算耗尽）：fuzz 未覆盖到 ≠ 无漏洞
         return _skip(
-            f"{len(calls)} 个种子均未触发运行时错误（未覆盖 ≠ 安全）",
+            f"{seeds_ran}/{len(calls)} 个种子未触发运行时错误（未覆盖 ≠ 安全）",
             finding_id,
-            iterations=len(calls),
+            iterations=seeds_ran,
+            seed_count=len(calls),
         )
     except subprocess.TimeoutExpired:
-        return _skip("运行超时（单个进程超过安全上限）", finding_id)
+        # 单种子超时已在循环内消化；这里兜底编译阶段超时等未捕获的超时
+        return _skip("编译或运行超时（超过安全上限）", finding_id)
     except Exception as exc:  # 动态工具绝不拖垮整图
         log_event("dynamic_check.error", finding_id=finding_id,
                   error=f"{type(exc).__name__}: {exc}")

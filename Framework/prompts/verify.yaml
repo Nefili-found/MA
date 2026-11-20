@@ -19,6 +19,12 @@ tool: |
   * get_function_body(function_name)：返回该函数的签名与实现（确认跨过程依赖）；
   * verify_taint(hypothesis, context)：工具侧的确定性核验（触发路径可达性 + 守卫/校验），
     返回 verdict/evidence，可作为你的证据之一，但不要照抄它的结论。
+  * dynamic_check(hypothesis, context)：仅对内存类 CWE（越界/UAF/双释放/溢出/格式化串等）
+    在沙箱内编译并运行变异种子，复现 ASan/段错误才给出有罪证据；没跑出来不代表安全。
+  * injection_check(hypothesis, context)：对命令注入/SQL 注入/XSS 做源码层核验，
+    检查危险 sink 是否命中、外部输入是否直达、有无参数化/转义/白名单写法。
+  * injection_runtime(hypothesis, context)：对命令注入/SQL 注入在沙箱内插探针复现，
+    载荷带出 canary 回显才算复现成功；未复现不代表安全，XSS 需浏览器环境不在此列。
   请先按需调用上下文工具（get_callers/get_callees/get_function_body）补充跨过程证据，再调用 verify_taint 取工具侧证据，最后给出你自己的裁决。
   注意：过大的源码或工具结果会以首尾预览 + 文件位置（stored at）给出，如需完整内容，请按需调用 get_function_body，或用 read 工具按 offset/limit 读取该文件。
 

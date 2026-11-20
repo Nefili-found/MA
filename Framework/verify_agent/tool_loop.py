@@ -23,6 +23,7 @@ from observability import log_event
 from tools.call_context import CONTEXT_TOOLS, get_callees, get_callers, get_function_body
 from tools.dynamic_check import dynamic_check, dynamic_check_tool
 from tools.injection_check import injection_check, injection_check_tool
+from tools.injection_runtime import injection_runtime, injection_runtime_tool
 from tools.verify_taint import verify_taint, verify_taint_tool
 from verify_agent.prompts import load_verify_prompts
 from verify_agent.signals import parse_llm_verdict
@@ -72,15 +73,25 @@ def build_model_payload(
     return payload, actions
 
 
-def available_tools() -> List[Any]:
-    """可绑定的工具集合：verify_taint + dynamic_check + 上下文工具（缺失的自动跳过）。"""
+def available_tools(
+    dynamic_enabled: bool = True,
+    injection_enabled: bool = True,
+) -> List[Any]:
+    """可绑定的工具集合：verify_taint + dynamic_check + 注入核验/探针 + 上下文工具（缺失的自动跳过）。
+
+    动态 / 注入工具受配置开关控制；关闭时不绑定，LLM 侧也就不会发起对应调用。
+    注入探针 ``injection_runtime`` 复用注入总开关；模块自身 ``INJRUNTIME_ENABLED``
+    作为第二道兜底（默认关闭）。
+    """
     tools: List[Any] = []
     if verify_taint_tool is not None:
         tools.append(verify_taint_tool)
-    if dynamic_check_tool is not None:
+    if dynamic_enabled and dynamic_check_tool is not None:
         tools.append(dynamic_check_tool)
-    if injection_check_tool is not None:
+    if injection_enabled and injection_check_tool is not None:
         tools.append(injection_check_tool)
+    if injection_enabled and injection_runtime_tool is not None:
+        tools.append(injection_runtime_tool)
     tools.extend(t for t in CONTEXT_TOOLS if t is not None)
     return tools
 
@@ -122,6 +133,13 @@ def dispatch_tool(
         finding_id = h.get("finding_id", "") if isinstance(h, dict) else ""
         return result, {"tool": "injection_check", "args": {"finding_id": finding_id}}
 
+    if name == "injection_runtime":
+        h = args.get("hypothesis", hypothesis)
+        c = args.get("context", context)
+        result = injection_runtime(h, c)
+        finding_id = h.get("finding_id", "") if isinstance(h, dict) else ""
+        return result, {"tool": "injection_runtime", "args": {"finding_id": finding_id}}
+
     if name in ("get_callers", "get_callees", "get_function_body"):
         impl = {
             "get_callers": get_callers,
@@ -159,7 +177,9 @@ def invoke_verify(
       ``_signal_llm``）；走纯工具兜底路径时为 ``None``，表示「无 LLM 信号」——
       与「LLM 表态 uncertain」严格区分。
     """
-    if llm is not None and available_tools():
+    dyn_on = getattr(settings, "verify_dynamic_enabled", True)
+    inj_on = getattr(settings, "verify_injection_enabled", True)
+    if llm is not None and available_tools(dyn_on, inj_on):
         try:
             call, result, reports, llm_sig = tool_loop(
                 llm, hypothesis, context, settings, ctx, session_id, finding_idx
@@ -194,7 +214,10 @@ def tool_loop(
     """
     from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
-    tools = available_tools()
+    tools = available_tools(
+        dynamic_enabled=getattr(settings, "verify_dynamic_enabled", True),
+        injection_enabled=getattr(settings, "verify_injection_enabled", True),
+    )
     bound = llm.bind_tools(tools)
 
     # 【优化 O-7】首轮 payload：大源码外存 + code 去重

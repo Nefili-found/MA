@@ -218,19 +218,26 @@ def _skip(reason: str, finding_id: str = "", **extra: Any) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # 对外入口
 # ---------------------------------------------------------------------------
-def injection_check(hypothesis: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+def injection_check(
+    hypothesis: Dict[str, Any],
+    context: Dict[str, Any],
+    enabled: Optional[bool] = None,
+) -> Dict[str, Any]:
     """对一条注入类 finding 做源码事实核验，返回与 verify_taint 同构的结果。
 
     :param hypothesis: ``{finding_id, title, cwe, location:{function},
         function_name, taint_source, taint_sink, ...}``
     :param context:    ``{file, line_range, code}``
+    :param enabled:    应用层开关；``None`` 时回退模块级 ``ENABLED``（环境变量
+                       ``INJCHECK_ENABLED``），显式 ``False`` 直接跳过。
     """
     hypothesis = hypothesis or {}
     context = context or {}
     finding_id = str(hypothesis.get("finding_id") or "")
 
-    if not ENABLED:
-        return _skip("INJCHECK_ENABLED=0", finding_id)
+    flag = ENABLED if enabled is None else bool(enabled)
+    if not flag:
+        return _skip("注入核验已关闭（verify.injection.enabled=false）", finding_id)
 
     cwe = _norm_cwe(hypothesis.get("cwe"))
     if cwe not in INJECTION_CWES:

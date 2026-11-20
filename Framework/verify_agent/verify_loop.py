@@ -97,7 +97,12 @@ def verify_findings(
         }
 
         # 信号 1：工具（代码事实，独立于 LLM）
-        tool_sig = tool_signal(hypothesis, context)
+        tool_sig = tool_signal(
+            hypothesis,
+            context,
+            dynamic_enabled=getattr(settings, "verify_dynamic_enabled", True),
+            injection_enabled=getattr(settings, "verify_injection_enabled", True),
+        )
         # 信号 2：LLM（语义，复用 bind_tools 多轮；无 LLM 时为 None）
         # 【健壮性包 B-2】VerifyError 只隔离当前 finding：标 uncertain + 记 errors，继续下一条
         try:
