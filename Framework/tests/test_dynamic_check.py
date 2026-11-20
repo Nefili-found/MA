@@ -10,6 +10,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tools.dynamic_check import (
     CONF_DYNAMIC_CRASH,
     MAX_ITERATIONS,
+    OUTCOME_DISABLED,
+    OUTCOME_NOT_APPLICABLE,
+    OUTCOME_TOOLCHAIN_MISSING,
     dynamic_check,
     _extract_function,
     _gen_calls,
@@ -137,5 +140,30 @@ for i, call in enumerate(calls2):
     assert f"static void seed_{i}(void) {{ {call} }}" in harness_text, f"seed_{i} 与调用不匹配"
     assert f"case {i}: seed_{i}();" in harness_text, f"case {i} 缺失"
 print("[12] seed index mapping: %d seeds → seed_i + case i" % len(calls2))
+
+# ---- A 档：结果分级 / 种子边界 / harness 防护片段（离线只验生成与降级） ----
+
+# 13) 结果分级：顶层 outcome 与证据 outcome 一致，分级口径与开关/适用域对应
+assert r_off["outcome"] == OUTCOME_DISABLED, r_off["outcome"]
+assert r_off["evidence"]["outcome"] == OUTCOME_DISABLED
+assert r2["outcome"] == OUTCOME_NOT_APPLICABLE, r2["outcome"]
+assert r["outcome"] == OUTCOME_TOOLCHAIN_MISSING, r["outcome"]
+assert r["evidence"]["outcome"] == OUTCOME_TOOLCHAIN_MISSING
+# 未崩 / 降级结果绝不 reject，且带超时计数档（离线无超时，记 0）
+assert r["evidence"].get("timeouts") == 0
+print("[13] outcome labels:", r_off["outcome"], "/", r2["outcome"], "/", r["outcome"])
+
+# 14) 种子边界：整数含 INT_MIN 极值；buffer 种子含随机字母串与转义串
+assert any("-2147483648" in c for c in calls2), "应含 INT_MIN 边界整数种子"
+assert any("\\n\\t" in c for c in calls2), "应含特殊转义串种子"
+assert any('"' in c and any(ch.isalnum() for ch in c) for c in calls2)
+print("[14] boundary seeds: INT_MIN + escape literal + random alnum literal present")
+
+# 15) harness 防护片段：rlimit 资源上限与危险信号保持默认处置（Linux 下生效）
+assert "_apply_limits" in harness_text
+assert "setrlimit" in harness_text
+assert "RLIMIT_AS" in harness_text and "RLIMIT_CPU" in harness_text
+assert "#ifdef __linux__" in harness_text
+print("[15] harness guard: rlimit(AS/STACK/CPU/FSIZE) + signal defaults present")
 
 print("SMOKE OK")

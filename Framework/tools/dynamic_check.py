@@ -18,6 +18,7 @@ LLM 种子输入 → 类型感知变异 → 提取被测函数嵌入可运行 ha
 from __future__ import annotations
 
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -28,6 +29,26 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from observability import log_event
 
 TOOL_NAME = "dynamic_check"
+
+# ---------------------------------------------------------------------------
+# 结果分级（对照 AutoSafeCoder FResult；判定口径不变：仅 crash 提权 accept）
+# ---------------------------------------------------------------------------
+#: 跑出运行时错误（ASan / 段错误 / UBSan）→ 有罪证据，accept 0.92
+OUTCOME_CRASH = "crash"
+#: 种子跑完未崩（fuzz 未覆盖到 ≠ 无漏洞）
+OUTCOME_SAFE = "safe"
+#: harness 编译失败（依赖外部符号 / 类型缺失等）
+OUTCOME_COMPILE_FAILED = "compile_failed"
+#: 存在种子执行超时（超时不计崩溃，单独记档）
+OUTCOME_TIMEOUT = "timeout"
+#: 参数形态无法生成有效种子（兜底 0 / NULL）
+OUTCOME_WEAK_INPUT = "weak_input"
+#: 本机 / 容器缺少编译运行工具链
+OUTCOME_TOOLCHAIN_MISSING = "toolchain_missing"
+#: 动态验证被开关关闭
+OUTCOME_DISABLED = "disabled"
+#: 非内存类 CWE，动态验证不适用
+OUTCOME_NOT_APPLICABLE = "not_applicable"
 
 # ---------------------------------------------------------------------------
 # 置信度常量
@@ -67,6 +88,13 @@ COVERAGE_ENABLED = os.environ.get("DYNCHECK_COVERAGE", "0") not in ("0", "false"
 MAX_ITERATIONS = int(os.environ.get("DYNCHECK_MAX_ITER", "24"))
 #: 全局开关：显式关闭时直接跳过（默认开启，由工具链存在性自动兜底）
 ENABLED = os.environ.get("DYNCHECK_ENABLED", "1") not in ("0", "false", "False")
+#: 变异随机种子；固定默认值保证离线可复现，设为任意值可换一批变异样本
+_SEED_RAW = os.environ.get("DYNCHECK_SEED", "0")
+try:
+    _SEED: int = int(_SEED_RAW)
+except ValueError:
+    _SEED = abs(hash(_SEED_RAW))
+_RNG = random.Random(_SEED)
 
 # ---------------------------------------------------------------------------
 # Docker 沙箱模式
@@ -146,12 +174,26 @@ _BUF_NAME_RE = re.compile(
 _LEN_NAME_RE = re.compile(r"(?:^|_)(?:len|length|size|count|num|cnt|n)$", re.IGNORECASE)
 _IDENT_RE = re.compile(r"[A-Za-z_]\w*")
 
-#: 字符串危险种子：空串 / 单字符 / 超长串 / 格式串
-_STR_SEEDS = ['""', '"A"', '"' + "A" * 64 + '"', '"%n%n%s"']
+#: 字符串危险种子：空串 / 单字符 / 超长重复串 / 格式串 / 特殊转义串
+_STR_SEEDS = [
+    '""',
+    '"A"',
+    '"' + "A" * 64 + '"',
+    '"%n%n%s"',
+    '"\\n\\t\\"\\\\ "',
+]
 #: malloc 异常尺寸（异常小 / 异常大缓冲区）
 _MALLOC_SIZES = ["0", "1", "4", "256", "4096"]
-#: 长度 / 整数种子
-_INT_SEEDS = ["-1", "0", "1", "4096", "0x7fffffff"]
+#: 长度 / 整数种子（含正负边界与极值）
+_INT_SEEDS = ["-1", "0", "1", "-2147483648", "4096", "0x7fffffff"]
+
+
+def _random_str_seed() -> str:
+    """由可复现 RNG 生成一条随机字母数字串字面量（C 字符串安全字符集）。"""
+    n = _RNG.randint(1, 32)
+    return '"' + "".join(_RNG.choice(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+        for _ in range(n)) + '"'
 
 
 def _param_name(p: str) -> str:
@@ -218,7 +260,8 @@ def _gen_calls(func_name: str, params: List[str]) -> List[str]:
 
     # 2) 串字面量直传 buffer（排在 malloc 矩阵前，避免被上限截断挤出）
     if has_buffer:
-        for seed in _STR_SEEDS:
+        str_seeds = list(_STR_SEEDS) + [_random_str_seed()]
+        for seed in str_seeds:
             calls.append(build("0", seed, "0"))
 
     # 3) malloc 异常尺寸缓冲 + 长度 / 整数种子
@@ -526,6 +569,27 @@ def _harness(
         "#include <stdlib.h>",
         "#include <string.h>",
         "#include <stdio.h>",
+        "#ifdef __linux__",
+        "#include <sys/resource.h>",
+        "#include <signal.h>",
+        "#endif",
+        "",
+        "static void _apply_limits(void) {",
+        "#ifdef __linux__",
+        "    struct rlimit rl;",
+        "    rl.rlim_cur = rl.rlim_max = 512UL * 1024UL * 1024UL;  /* 地址空间 512MB */",
+        "    setrlimit(RLIMIT_AS, &rl);",
+        "    rl.rlim_cur = rl.rlim_max = 64UL * 1024UL * 1024UL;   /* 栈 64MB */",
+        "    setrlimit(RLIMIT_STACK, &rl);",
+        "    rl.rlim_cur = rl.rlim_max = 3UL;                       /* CPU 时间 3s */",
+        "    setrlimit(RLIMIT_CPU, &rl);",
+        "    rl.rlim_cur = rl.rlim_max = 1024UL * 1024UL;          /* 可写文件 1MB */",
+        "    setrlimit(RLIMIT_FSIZE, &rl);",
+        "    signal(SIGSEGV, SIG_DFL);",
+        "    signal(SIGABRT, SIG_DFL);",
+        "    signal(SIGBUS, SIG_DFL);",
+        "#endif",
+        "}",
         "",
     ]
     if type_defs:
@@ -540,6 +604,7 @@ def _harness(
         parts.append(f"static void seed_{i}(void) {{ {call} }}")
     parts.append("")
     parts.append("int main(int argc, char **argv) {")
+    parts.append("    _apply_limits();")
     parts.append("    int idx = argc > 1 ? atoi(argv[1]) : 0;")
     parts.append("    switch (idx) {")
     for i in range(len(calls)):
@@ -551,9 +616,15 @@ def _harness(
     return "\n".join(parts)
 
 
-def _skip(reason: str, finding_id: str = "", **extra: Any) -> Dict[str, Any]:
-    """统一降级返回：uncertain + 0.0 置信度（绝不 reject）。"""
-    ev: Dict[str, Any] = {"skipped": True, "reason": reason}
+def _skip(reason: str, finding_id: str = "", *,
+          outcome: str = OUTCOME_SAFE, **extra: Any) -> Dict[str, Any]:
+    """统一降级返回：uncertain + 0.0 置信度（绝不 reject）。
+
+    :param outcome: 结果分级（见 ``OUTCOME_*``），仅用于证据归档，不改变判定口径。
+    """
+    ev: Dict[str, Any] = {
+        "skipped": True, "reason": reason, "outcome": outcome, "timeouts": 0,
+    }
     ev.update(extra)
     return {
         "status": "uncertain",
@@ -561,6 +632,7 @@ def _skip(reason: str, finding_id: str = "", **extra: Any) -> Dict[str, Any]:
         "confidence": 0.0,
         "reason": f"动态验证跳过：{reason}",
         "evidence": ev,
+        "outcome": outcome,
         "tool_name": TOOL_NAME,
         "raw_output": {"finding_id": finding_id},
     }
@@ -594,21 +666,24 @@ def dynamic_check(
 
     flag = ENABLED if enabled is None else bool(enabled)
     if not flag:
-        return _skip("动态验证已关闭（verify.dynamic.enabled=false）", finding_id)
+        return _skip("动态验证已关闭（verify.dynamic.enabled=false）", finding_id,
+                     outcome=OUTCOME_DISABLED)
     if not _is_memory_cwe(hypothesis):
         return _skip(
             f"CWE {_norm_cwe(hypothesis.get('cwe')) or '?'} 非内存类，动态验证不适用",
             finding_id,
+            outcome=OUTCOME_NOT_APPLICABLE,
         )
     use_docker = _docker_available()
     compiler = None if use_docker else _toolchain()
     if not use_docker and not compiler:
         return _skip("未找到 gcc/clang/docker（预期在 Linux/Docker 运行时挂载）",
-                     finding_id)
+                     finding_id, outcome=OUTCOME_TOOLCHAIN_MISSING)
 
     code = str(context.get("code") or "")
     if not code.strip():
-        return _skip("context.code 为空", finding_id)
+        return _skip("context.code 为空", finding_id,
+                     outcome=OUTCOME_WEAK_INPUT)
 
     func_name = str(
         (hypothesis.get("location") or {}).get("function")
@@ -616,18 +691,22 @@ def dynamic_check(
         or ""
     ).strip()
     if not func_name:
-        return _skip("hypothesis 未提供被测函数名", finding_id)
+        return _skip("hypothesis 未提供被测函数名", finding_id,
+                     outcome=OUTCOME_WEAK_INPUT)
 
     func_src = _extract_function(code, func_name)
     if not func_src:
-        return _skip(f"未能从源码提取函数 {func_name}", finding_id)
+        return _skip(f"未能从源码提取函数 {func_name}", finding_id,
+                     outcome=OUTCOME_WEAK_INPUT)
 
     m = _FUNC_RE.search(func_src)
     if not m:
-        return _skip(f"未能解析 {func_name} 的签名", finding_id)
+        return _skip(f"未能解析 {func_name} 的签名", finding_id,
+                     outcome=OUTCOME_WEAK_INPUT)
     calls = _gen_calls(func_name, _split_params(m.group("params")))
     if not calls:
-        return _skip(f"{func_name} 参数形态无法生成种子", finding_id)
+        return _skip(f"{func_name} 参数形态无法生成种子", finding_id,
+                     outcome=OUTCOME_WEAK_INPUT)
 
     # harness 依赖补齐：同文件被调函数闭包 + 类型定义纳入编译单元；
     # 外部 / 跨文件符号不补桩，编译失败仍按 uncertain 降级。
@@ -702,12 +781,15 @@ def dynamic_check(
                 return rp_run.returncode != 0 or any(mk in blob for mk in _CRASH_MARKS)
             except Exception:
                 return False
+            finally:
+                shutil.rmtree(replay_dir, ignore_errors=True)
 
         rc, stderr = _compile()
         if rc != 0:
             log_event("dynamic_check.compile_failed", finding_id=finding_id)
             return _skip("harness 编译失败（被测函数可能依赖外部符号）",
-                         finding_id, compile_stderr_tail=stderr[-600:],
+                         finding_id, outcome=OUTCOME_COMPILE_FAILED,
+                         compile_stderr_tail=stderr[-600:],
                          dependency_functions=dep_names)
 
         # 逐种子起独立进程：任一崩溃即定案，并定位到具体种子索引；
@@ -718,6 +800,7 @@ def dynamic_check(
         crash_mark = "crash"
         crash_blob = ""
         seeds_ran = 0
+        timeouts = 0
         signatures: Dict[int, Optional[frozenset]] = {}
         for i, call in enumerate(calls):
             if time.monotonic() >= deadline:
@@ -729,6 +812,7 @@ def dynamic_check(
                 rc, blob = _run(i)
             except subprocess.TimeoutExpired:
                 # 该种子超时：不作为崩溃证据，继续尝试后续种子
+                timeouts += 1
                 continue
             seeds_ran += 1
             signatures[i] = _coverage_signature(workdir)
@@ -743,12 +827,14 @@ def dynamic_check(
                 "status": "verified",
                 "verdict": "accept",
                 "confidence": CONF_DYNAMIC_CRASH,
+                "outcome": OUTCOME_CRASH,
                 "reason": (
                     f"动态执行复现运行时错误（{crash_mark}，"
                     f"种子 #{crash_idx + 1}/{len(calls)}）"
                 ),
                 "evidence": {
                     "crash": True,
+                    "outcome": OUTCOME_CRASH,
                     "crash_type": crash_mark,
                     "trigger_call": min_call,
                     "trigger_calls": [min_call],
@@ -756,6 +842,7 @@ def dynamic_check(
                     "seed_index": crash_idx,
                     "seed_count": len(calls),
                     "seeds_ran": seeds_ran,
+                    "timeouts": timeouts,
                     "coverage_enabled": COVERAGE_ENABLED,
                     "dependency_functions": dep_names,
                     "dependency_source": dep_source,
@@ -769,19 +856,26 @@ def dynamic_check(
             }
 
         # 全部跑通（或预算耗尽）：fuzz 未覆盖到 ≠ 无漏洞
+        final_outcome = OUTCOME_TIMEOUT if timeouts > 0 else OUTCOME_SAFE
         return _skip(
             f"{seeds_ran}/{len(calls)} 个种子未触发运行时错误（未覆盖 ≠ 安全）",
             finding_id,
+            outcome=final_outcome,
             iterations=seeds_ran,
             seed_count=len(calls),
+            timeouts=timeouts,
         )
     except subprocess.TimeoutExpired:
         # 单种子超时已在循环内消化；这里兜底编译阶段超时等未捕获的超时
-        return _skip("编译或运行超时（超过安全上限）", finding_id)
+        return _skip("编译或运行超时（超过安全上限）", finding_id,
+                     outcome=OUTCOME_TIMEOUT)
     except Exception as exc:  # 动态工具绝不拖垮整图
         log_event("dynamic_check.error", finding_id=finding_id,
                   error=f"{type(exc).__name__}: {exc}")
         return _skip(f"内部异常 {type(exc).__name__}: {exc}", finding_id)
+    finally:
+        # 清理编译/运行临时目录（含 harness 源码、二进制、覆盖产物）
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
