@@ -41,10 +41,11 @@ ENABLED = os.environ.get("INJRUNTIME_ENABLED", "0") not in ("0", "false", "False
 #: 本模块尝试动态复现的注入类 CWE；79（XSS）需浏览器，不在此列。
 RUNTIME_CWES = frozenset({"78", "89"})
 
-#: 命令注入探针 canary：载荷闭合当前命令并回显该标记。
+#: 命令注入探针 canary：载荷作为一条自包含命令回显该标记。
 CANARY = "DYNCANARY7f3a"
-#: 命令注入探针载荷：闭合当前命令并回显 canary。
-_CMD_PAYLOAD = f";echo {CANARY};"
+#: 命令注入探针载荷：自包含 echo 命令，sh/cmd 下均可独立执行并回显 canary；
+#: 不使用前导分隔符，避免独立调用时 shell 把前导 `;` 判为语法错误。
+_CMD_PAYLOAD = f"echo {CANARY}"
 
 #: SQL 注入探针载荷：闭合字符串字面量，布尔绕过注释后续语句。
 _SQL_PAYLOAD = "' OR '1'='1' -- "

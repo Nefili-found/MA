@@ -16,6 +16,7 @@ import tools.dynamic_check as dc  # noqa: E402
 from tools.injection_runtime import (  # noqa: E402
     CANARY,
     injection_runtime,
+    _CMD_PAYLOAD,
     _cmd_probe_call,
     _cmd_probe_harness,
     _cmd_reproduced,
@@ -98,7 +99,7 @@ def t_cmd_probe_harness_text() -> None:
 # 4b) 命令探针实参生成：首个 char* 传载荷，其余 char* 传空串，数值形参传 0
 def t_cmd_probe_args() -> None:
     call = _cmd_probe_call("run", ["const char *u", "int n"])
-    assert '"' + ";echo " + CANARY + ';"' in call
+    assert '"' + _CMD_PAYLOAD + '"' in call
     assert ", 0)" in call
     params = _parse_params("void run(const char *u, int n) { system(u); }")
     assert params == ["const char *u", "int n"]

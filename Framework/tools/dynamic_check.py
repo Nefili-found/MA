@@ -871,7 +871,7 @@ def _harness(
         "static void _apply_limits(void) {",
         "#ifdef __linux__",
         "    struct rlimit rl;",
-        "    rl.rlim_cur = rl.rlim_max = 512UL * 1024UL * 1024UL;  /* 地址空间 512MB */",
+        "    rl.rlim_cur = rl.rlim_max = 1024UL * 1024UL * 1024UL;  /* 地址空间 1GB（留余量给 ASan 影子内存/红区） */",
         "    setrlimit(RLIMIT_AS, &rl);",
         "    rl.rlim_cur = rl.rlim_max = 64UL * 1024UL * 1024UL;   /* 栈 64MB */",
         "    setrlimit(RLIMIT_STACK, &rl);",
