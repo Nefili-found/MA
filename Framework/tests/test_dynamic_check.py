@@ -3,6 +3,7 @@
 import json
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -20,7 +21,12 @@ from tools.dynamic_check import (
     _extract_type_definitions,
     _param_role,
     _harness,
+    _minimize_call,
+    _parse_gcov_lines,
+    _read_line_coverage,
     _FUNC_RE,
+    _NUMERIC_RE,
+    _STRING_LITERAL_RE,
     _toolchain,
 )
 
@@ -165,5 +171,60 @@ assert "setrlimit" in harness_text
 assert "RLIMIT_AS" in harness_text and "RLIMIT_CPU" in harness_text
 assert "#ifdef __linux__" in harness_text
 print("[15] harness guard: rlimit(AS/STACK/CPU/FSIZE) + signal defaults present")
+
+# ---- 步骤 2/3：最小化二分与覆盖率行级解析（离线用样例文本/回调验证） ----
+
+# 16) 数值收缩：大整数被替换为仍复现崩溃的最简候选；replay=None 原样返回
+call_num = 'copy_name((char*)malloc(64), "longstringAAAA", 4096);'
+
+
+def _replay_num(trial: str) -> bool:
+    # 模拟：去掉 4096 这个危险大长度后崩溃仍复现
+    return "4096" not in trial
+
+
+min_num, rec_num = _minimize_call(call_num, replay=_replay_num)
+print("[16] minimized num:", min_num, "| steps:", rec_num["steps"])
+assert "4096" not in min_num
+assert rec_num["minimized"] is True
+min_raw, rec_raw = _minimize_call(call_num, replay=None)
+assert min_raw == call_num and rec_raw["minimized"] is False
+
+# 17) 串二分：前缀仍崩则继续砍；前缀不崩即保守停止，记录截断步
+call_str = 'copy_name("longstringAAAA", 1);'
+
+
+def _replay_str(trial: str) -> bool:
+    m = _STRING_LITERAL_RE.search(trial)
+    return m is not None and len(m.group(1)) <= 7
+
+
+min_str, rec_str = _minimize_call(call_str, replay=_replay_str)
+m_str = _STRING_LITERAL_RE.search(min_str)
+print("[17] minimized str:", m_str.group(1), "| steps:", rec_str["steps"])
+assert len(m_str.group(1)) <= 14  # 不超过原始长度
+assert rec_str["minimized"] is True
+
+# 18) gcov 文本解析：正计数行计入覆盖，不可执行/未覆盖行不计入
+GCOV_SAMPLE = """
+        -:    0:Source:copy.c
+        2:    1:#include <string.h>
+        5:    2:void copy_name(char *dst, const char *src, int len) {
+    #####:    3:    memcpy(dst, src, len);
+        1:    4:}
+"""
+covered = _parse_gcov_lines(GCOV_SAMPLE)
+print("[18] gcov covered lines:", sorted(covered))
+assert covered == {1, 2, 4}
+
+# 19) _read_line_coverage：有 .gcov 文本返回行号集合；空目录返回 None
+with tempfile.TemporaryDirectory() as td:
+    cov = _read_line_coverage(td)
+    assert cov is None, "无 .gcov 文本应返回 None"
+    with open(Path(td) / "harness.gcov", "w", encoding="utf-8") as fh:
+        fh.write(GCOV_SAMPLE)
+    cov2 = _read_line_coverage(td)
+    assert cov2 == {1, 2, 4}
+print("[19] line coverage readback:", sorted(cov2))
 
 print("SMOKE OK")

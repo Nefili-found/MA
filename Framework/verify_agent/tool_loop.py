@@ -101,11 +101,18 @@ def dispatch_tool(
     args: Dict[str, Any],
     hypothesis: Dict[str, Any],
     context: Dict[str, Any],
+    dyn_on: bool = True,
+    inj_on: bool = True,
 ) -> Any:
     """按工具名分发，返回 ``(result, call_record)``。
 
     * verify_taint：失败直接抛出（由上层包成 ``VerifyError``，只隔离该 finding）；
     * 上下文工具：内部已降级，额外再兜一层 try/except，绝不中断主流程。
+
+    :param dyn_on: 应用层动态执行开关，透传给 ``dynamic_check`` 的 ``enabled``；
+    :param inj_on: 应用层注入核验/探针开关，透传给两个注入工具的 ``enabled``。
+        开关关闭时工具本就不绑定到 LLM；此处为兜底直连路径补齐同一道开关，
+        避免绕过绑定层后回退到工具模块级环境变量。
     """
     args = args or {}
     # 兼容 LangChain 暴露的 *_tool 命名（verify_taint_tool / get_callers_tool 等）
@@ -122,21 +129,21 @@ def dispatch_tool(
     if name == "dynamic_check":
         h = args.get("hypothesis", hypothesis)
         c = args.get("context", context)
-        result = dynamic_check(h, c)
+        result = dynamic_check(h, c, enabled=dyn_on)
         finding_id = h.get("finding_id", "") if isinstance(h, dict) else ""
         return result, {"tool": "dynamic_check", "args": {"finding_id": finding_id}}
 
     if name == "injection_check":
         h = args.get("hypothesis", hypothesis)
         c = args.get("context", context)
-        result = injection_check(h, c)
+        result = injection_check(h, c, enabled=inj_on)
         finding_id = h.get("finding_id", "") if isinstance(h, dict) else ""
         return result, {"tool": "injection_check", "args": {"finding_id": finding_id}}
 
     if name == "injection_runtime":
         h = args.get("hypothesis", hypothesis)
         c = args.get("context", context)
-        result = injection_runtime(h, c)
+        result = injection_runtime(h, c, enabled=inj_on)
         finding_id = h.get("finding_id", "") if isinstance(h, dict) else ""
         return result, {"tool": "injection_runtime", "args": {"finding_id": finding_id}}
 
@@ -214,9 +221,11 @@ def tool_loop(
     """
     from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
+    dyn_on = getattr(settings, "verify_dynamic_enabled", True)
+    inj_on = getattr(settings, "verify_injection_enabled", True)
     tools = available_tools(
-        dynamic_enabled=getattr(settings, "verify_dynamic_enabled", True),
-        injection_enabled=getattr(settings, "verify_injection_enabled", True),
+        dynamic_enabled=dyn_on,
+        injection_enabled=inj_on,
     )
     bound = llm.bind_tools(tools)
 
@@ -266,7 +275,10 @@ def tool_loop(
         for tc in tool_calls:
             name = tc.get("name")
             args = tc.get("args", {}) or {}
-            result, call_record = dispatch_tool(name, args, hypothesis, context)
+            result, call_record = dispatch_tool(
+                name, args, hypothesis, context,
+                dyn_on=dyn_on, inj_on=inj_on,
+            )
             trace.append(call_record)
             if name == "verify_taint":
                 last_result = result

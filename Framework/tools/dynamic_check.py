@@ -424,12 +424,59 @@ def _coverage_flags() -> List[str]:
     return ["--coverage"] if COVERAGE_ENABLED else []
 
 
-def _coverage_signature(workdir: str) -> Optional[frozenset]:
-    """读取 gcov 覆盖产物（.gcda）汇总为粗粒度覆盖签名；无产物返回 None。
+#: gcov 文本行：``  计数: 行号: 源码``；计数为正整数=已覆盖，``-``=不可执行，
+#: ``#####``=未覆盖。行级增量需工具链环境生成 .gcov 文本后才填得上。
+_GCOV_LINE_RE = re.compile(r"^\s*(?P<count>\d+|-|#+\s*):\s*(?P<line>\d+):")
 
-    注意：当前只按产物文件名 + 大小汇总，不是行级覆盖；行级增量需后续接
-    gcov / llvm-cov 解析。无编译环境时返回 None，种子排序退回原序。
+
+def _parse_gcov_lines(text: str) -> frozenset:
+    """解析 gcov/llvm-cov 文本输出，返回**已覆盖行号集合**；无可执行行返回空集。"""
+    covered: set = set()
+    for line in text.splitlines():
+        m = _GCOV_LINE_RE.match(line)
+        if not m:
+            continue
+        cnt = m.group("count")
+        if cnt.isdigit() and int(cnt) > 0:
+            covered.add(int(m.group("line")))
+    return frozenset(covered)
+
+
+def _read_line_coverage(workdir: str) -> Optional[frozenset]:
+    """读取 workdir 下 ``.gcov`` 文本产物汇总行级覆盖；无文本产物返回 None。
+
+    说明：gcc 带 ``--coverage`` 运行后先产出 ``.gcda``，需再跑一次 ``gcov`` /
+    ``llvm-cov`` 导出 ``.gcov`` 文本；该触发步骤依赖工具链，当前环境未验证，
+    此处只负责读已有文本。
     """
+    covered: set = set()
+    found = False
+    try:
+        names = os.listdir(workdir)
+    except OSError:
+        return None
+    for name in names:
+        if not name.endswith(".gcov"):
+            continue
+        found = True
+        try:
+            with open(os.path.join(workdir, name), encoding="utf-8",
+                      errors="replace") as fh:
+                covered |= set(_parse_gcov_lines(fh.read()))
+        except OSError:
+            continue
+    return frozenset(covered) if found else None
+
+
+def _coverage_signature(workdir: str) -> Optional[frozenset]:
+    """汇总覆盖签名：优先行级覆盖行号集合；无 .gcov 文本时回退 .gcda 粗签名。
+
+    无任何覆盖产物返回 None，种子排序退回原序。行级解析逻辑可离线用样例
+    gcov 文本验证；真实 .gcov 产物的生成与增量排序需在有工具链的环境调通。
+    """
+    line_cov = _read_line_coverage(workdir)
+    if line_cov is not None:
+        return line_cov
     sig: set = set()
     try:
         names = os.listdir(workdir)
@@ -510,20 +557,23 @@ def _minimize_call(
         不可用（无工具链）时传 ``None``，原样返回不缩减。
     :return: ``(最小化后的 call, 缩减记录)``。
 
-    缩减顺序：长度/整数向 0/1 收缩 → malloc 尺寸收缩到 1 → 串字面量减半；
-    每一步只有 replay 仍返回 True 才保留。串截断为单次减半，完整二分留待后续。
+    缩减顺序：长度/整数向 0/1/-1/2 收缩 → malloc 尺寸收缩到 1 →
+    串字面量二分截断到最短仍崩前缀。每一步只有 replay 仍返回 True 才保留；
+    前缀不再复现崩溃即停止对该串继续二分（保守收缩，不破坏崩溃条件）。
     """
     record: Dict[str, Any] = {"minimized": False, "steps": []}
     if replay is None:
         return call, record
 
     current = call
+    # 整数收缩候选（从大值向最简常用值依次尝试，保留首个仍崩的）
+    num_candidates = ["0", "1", "-1", "2"]
 
-    # 1) 数值参数：大值 → 0 / 1（逐个尝试，保留仍崩的最简值）
+    # 1) 数值参数：大值 → 0 / 1 / -1 / 2（逐个尝试，保留仍崩的最简值）
     for num in _NUMERIC_RE.findall(current):
-        if num in ("0", "1", "-1"):
+        if num in num_candidates:
             continue
-        for cand in ("0", "1"):
+        for cand in num_candidates:
             trial = current.replace(num, cand, 1)
             if replay(trial):
                 current = trial
@@ -539,16 +589,26 @@ def _minimize_call(
 
     current = re.sub(r"malloc\((\d+)\)", _malloc_shrink, current)
 
-    # 3) 串字面量减半（单次；完整二分截断留待后续）
-    def _str_half(m: re.Match) -> str:
+    # 3) 串字面量二分截断：逐串缩到最短仍复现崩溃的前缀
+    def _str_bisect(m: re.Match) -> str:
+        nonlocal current
         s = m.group(1)
         if len(s) <= 1:
             return m.group(0)
-        half = s[: len(s) // 2]
-        trial = current.replace(m.group(0), f'"{half}"', 1)
-        return f'"{half}"' if replay(trial) else m.group(0)
+        cur = s
+        while len(cur) > 1:
+            half = cur[: len(cur) // 2]
+            trial = current.replace(m.group(0), f'"{half}"', 1)
+            if replay(trial):
+                current = trial
+                record["steps"].append(f"str {len(s)}->{len(half)}")
+                cur = half
+            else:
+                # 前缀不再复现崩溃：保留当前 cur，停止该串二分
+                break
+        return f'"{cur}"'
 
-    current = _STRING_LITERAL_RE.sub(_str_half, current)
+    current = _STRING_LITERAL_RE.sub(_str_bisect, current)
 
     record["minimized"] = current != call
     return current, record

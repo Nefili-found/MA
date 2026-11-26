@@ -70,8 +70,9 @@ def t_filter_by_switch() -> None:
 def t_dispatch_runtime() -> None:
     calls = {"n": 0}
 
-    def _fake_runtime(hypothesis: dict, context: dict) -> dict:
+    def _fake_runtime(hypothesis: dict, context: dict, **kw) -> dict:
         calls["n"] += 1
+        calls["enabled"] = kw.get("enabled")
         return {**_base_uncertain(), "evidence": {"probe_type": "command_canary"}}
 
     orig = tl.injection_runtime
@@ -79,11 +80,13 @@ def t_dispatch_runtime() -> None:
     try:
         hyp = {"finding_id": "rt-1", "cwe": "78"}
         ctx = {"file": "x.c", "code": "system(cmd);"}
-        result, record = tl.dispatch_tool("injection_runtime", {}, hyp, ctx)
+        result, record = tl.dispatch_tool("injection_runtime", {}, hyp, ctx,
+                                          inj_on=True)
         assert calls["n"] == 1, "应恰好调用一次探针"
         assert record["tool"] == "injection_runtime", record
         assert record["args"]["finding_id"] == "rt-1"
         assert result["evidence"]["probe_type"] == "command_canary"
+        assert calls["enabled"] is True
     finally:
         tl.injection_runtime = orig
 
@@ -92,7 +95,7 @@ def t_dispatch_runtime() -> None:
 def t_dispatch_runtime_suffixed() -> None:
     calls = {"n": 0}
 
-    def _fake_runtime(hypothesis: dict, context: dict) -> dict:
+    def _fake_runtime(hypothesis: dict, context: dict, **kw) -> dict:
         calls["n"] += 1
         return _base_uncertain()
 
@@ -108,11 +111,38 @@ def t_dispatch_runtime_suffixed() -> None:
         tl.injection_runtime = orig
 
 
+# 5) 应用层开关透传：dyn_on → dynamic_check.enabled；inj_on → 注入工具.enabled
+def t_dispatch_passes_enabled() -> None:
+    dyn_calls: dict = {}
+    inj_calls: dict = {}
+
+    def _fake_dyn(hypothesis: dict, context: dict, **kw) -> dict:
+        dyn_calls["enabled"] = kw.get("enabled")
+        return _base_uncertain()
+
+    def _fake_inj(hypothesis: dict, context: dict, **kw) -> dict:
+        inj_calls["enabled"] = kw.get("enabled")
+        return _base_uncertain()
+
+    orig_dyn, orig_inj = tl.dynamic_check, tl.injection_check
+    tl.dynamic_check, tl.injection_check = _fake_dyn, _fake_inj
+    try:
+        tl.dispatch_tool("dynamic_check", {}, {"finding_id": "d-1"}, {"code": ""},
+                         dyn_on=False, inj_on=True)
+        tl.dispatch_tool("injection_check", {}, {"finding_id": "i-1"}, {"code": ""},
+                         dyn_on=True, inj_on=False)
+        assert dyn_calls["enabled"] is False, "动态开关关闭应透传 enabled=False"
+        assert inj_calls["enabled"] is False, "注入开关关闭应透传 enabled=False"
+    finally:
+        tl.dynamic_check, tl.injection_check = orig_dyn, orig_inj
+
+
 def main() -> int:
     check("注入开关开启时绑定核验/探针工具", t_bind_when_injection_on)
     check("开关关闭时按规则过滤工具", t_filter_by_switch)
     check("dispatch 分发到注入探针并透传参数", t_dispatch_runtime)
     check("带 _tool 后缀的工具名归一后可分发", t_dispatch_runtime_suffixed)
+    check("应用层开关透传到工具 enabled", t_dispatch_passes_enabled)
     print("TOOL_LOOP_RUNTIME OK")
     return 0
 
