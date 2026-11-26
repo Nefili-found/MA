@@ -49,12 +49,14 @@ _CMD_PAYLOAD = f"echo {CANARY}"
 
 #: SQL 注入探针载荷：闭合字符串字面量，布尔绕过注释后续语句。
 _SQL_PAYLOAD = "' OR '1'='1' -- "
-#: SQL 探针基准行标记，内存库初始仅插入这一行。
+#: SQL 探针基准行标记，内存库初始插入基准行与第二行隐藏行。
 _SQL_MARK = "SQLPROBE_BASE"
-#: SQL 探针可执行的最少返回行数（基准 1 行；布尔绕过 >1 行视为复现）。
+_SQL_MARK_SECRET = "SQLPROBE_SECRET"
+#: SQL 探针可复现的最少返回行数：基准 2 行，布尔绕过把可见行从 1 提升到 2，ROWS>阈值视为复现。
 _SQL_ROW_THRESHOLD = 1
 
 _CWE_RE = re.compile(r"(?:CWE[-_ ]?)?(\d{1,5})", re.IGNORECASE)
+_INT_RET_RE = re.compile(r"\b(int|long|short|size_t|unsigned)\b", re.IGNORECASE)
 _FUNC_RE = re.compile(
     r"(?P<prefix>(?:static\s+|extern\s+|inline\s+)*)"
     r"(?P<ret>(?:const\s+)?(?:void|int|long|short|char|float|double|size_t|unsigned\s+\w+|"
@@ -145,6 +147,26 @@ def _cmd_probe_call(func_name: str, params: List[str]) -> str:
     return f"{func_name}({', '.join(args)});"
 
 
+def _sql_exec_probe_call(func_name: str, params: List[str]) -> str:
+    """exec 型调用：首参 ``sqlite3*`` 传 db，首个 char* 传 SQL 载荷，其余 char* 传空串，其余类型传 0。"""
+    args: List[str] = []
+    payload_used = False
+    for decl in params:
+        if "sqlite3" in decl and "*" in decl:
+            args.append("db")
+        elif "char" in decl and "*" in decl:
+            if not payload_used:
+                args.append(f'"{_SQL_PAYLOAD}"')
+                payload_used = True
+            else:
+                args.append('""')
+        else:
+            args.append("0")
+    if not params:
+        args.append(f'"{_SQL_PAYLOAD}"')
+    return f"{func_name}({', '.join(args)});"
+
+
 def _cmd_probe_harness(func_src: str, probe_call: str) -> str:
     """命令注入探针 harness：调用被测函数，stdout/stderr 待检测 canary 回显。"""
     return (
@@ -156,6 +178,12 @@ def _cmd_probe_harness(func_src: str, probe_call: str) -> str:
         "    return 0;\n"
         "}\n"
     )
+
+
+def _returns_int(func_src: str) -> bool:
+    """被测函数返回类型是否为整型（可回传命中行数供探针观测）。"""
+    m = _FUNC_RE.search(func_src)
+    return bool(m and _INT_RET_RE.search(m.group("ret")))
 
 
 def _sql_mode(func_src: str) -> str:
@@ -170,29 +198,30 @@ def _sql_mode(func_src: str) -> str:
 def _sql_probe_harness(func_src: str, func_name: str, mode: str) -> str:
     """SQL 注入探针 harness：在内存库上执行探针载荷，输出可观测信号。
 
-    * ``exec``：被测函数接收 ``sqlite3*`` 并直接执行语句；harness 建表插基准行后调用，
-      再统计 ``probe_t`` 行数（布尔绕过 >1 行视为复现）。
+    * ``exec``：被测函数接收 ``sqlite3*`` 并直接执行语句；harness 建表插基准行 + 隐藏行后调用，
+      读取被测函数回传的命中行数（``ROWS``）；布尔绕过可见行从 1 升到 2，ROWS>阈值视为复现。
+      返回 void 等无法回传行数的形态标记 ``ROWS=NA``，判据降级、不伪造有罪证据。
     * ``build``：被测函数返回拼接后的 SQL 串；harness 打印该串并尝试执行，观测载荷
       是否原样进入拼接结果。
     """
     if mode == "exec":
+        params = _parse_params(func_src)
+        exec_call = _sql_exec_probe_call(func_name, params).rstrip(";")
+        if _returns_int(func_src):
+            call_line = (
+                f"    int n = {exec_call};\n"
+                "    printf(\"ROWS=%d\\n\", n);\n"
+            )
+        else:
+            # 返回 void 等形态无法回传命中行数：不伪造行数证据，标记 NA 供判据降级。
+            call_line = f"    {exec_call};\n    printf(\"ROWS=NA\\n\");\n"
         body = (
             "    sqlite3_exec(db, \"CREATE TABLE probe_t(id INTEGER, note TEXT)\", NULL, NULL, NULL);\n"
             f"    sqlite3_exec(db, \"INSERT INTO probe_t VALUES(1, '{_SQL_MARK}')\", NULL, NULL, NULL);\n"
-            f"    {func_name}(db, \"{_SQL_PAYLOAD}\");\n"
-            "    printf(\"COUNT=%d\\n\", _sql_count(db));\n"
+            f"    sqlite3_exec(db, \"INSERT INTO probe_t VALUES(2, '{_SQL_MARK_SECRET}')\", NULL, NULL, NULL);\n"
+            f"{call_line}"
         )
-        helpers = (
-            "static int _sql_count(sqlite3 *db) {\n"
-            "    sqlite3_stmt *st = NULL;\n"
-            "    int n = 0;\n"
-            "    if (sqlite3_prepare_v2(db, \"SELECT count(*) FROM probe_t\", -1, &st, NULL) == SQLITE_OK) {\n"
-            "        if (sqlite3_step(st) == SQLITE_ROW) n = sqlite3_column_int(st, 0);\n"
-            "        sqlite3_finalize(st);\n"
-            "    }\n"
-            "    return n;\n"
-            "}\n"
-        )
+        helpers = ""
     else:
         body = (
             f"    const char *sql = {func_name}(\"{_SQL_PAYLOAD}\");\n"
@@ -229,11 +258,11 @@ def _sql_reproduced(blob: str, mode: str) -> bool:
     """SQL 注入有罪信号。
 
     * ``build``：拼接结果原样带出布尔绕过载荷片段；
-    * ``exec``：探针表返回行数大于基准 1 行（布尔绕过）。
+    * ``exec``：被测函数回传的命中行数 ROWS 大于基准 1 行（布尔绕过）；``ROWS=NA`` 视为不可观测，不复现。
     """
     if mode == "build":
         return "' OR '1'='1" in blob
-    m = re.search(r"COUNT=(\d+)", blob)
+    m = re.search(r"ROWS=(\d+)", blob)
     return bool(m and int(m.group(1)) > _SQL_ROW_THRESHOLD)
 
 
@@ -349,7 +378,10 @@ def injection_runtime(
             def reproduced(blob: str) -> bool:
                 return _sql_reproduced(blob, mode)
 
-            probe_call = f'{func_name}("{_SQL_PAYLOAD}")'
+            if mode == "exec":
+                probe_call = _sql_exec_probe_call(func_name, _parse_params(func_src))
+            else:
+                probe_call = f'{func_name}("{_SQL_PAYLOAD}")'
 
         result = _compile_and_run(compiler, harness, extra_libs)
         if result["stage"] == "compile":

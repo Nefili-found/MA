@@ -21,6 +21,8 @@ from tools.injection_runtime import (  # noqa: E402
     _cmd_probe_harness,
     _cmd_reproduced,
     _parse_params,
+    _returns_int,
+    _sql_exec_probe_call,
     _sql_mode,
     _sql_probe_harness,
     _sql_reproduced,
@@ -107,14 +109,37 @@ def t_cmd_probe_args() -> None:
 
 # 4c) SQL 探针：mode 分流 + harness 文本 + 复现解析（不依赖真编译/链接）
 def t_sql_probe_logic() -> None:
-    exec_src = "void query(sqlite3 *db, char *s) { sqlite3_exec(db, s, 0, 0); }"
+    exec_src = (
+        "int query(sqlite3 *db, char *s) {\n"
+        "    char sql[512];\n"
+        "    snprintf(sql, sizeof(sql), \"SELECT count(*) FROM probe_t WHERE note='%s'\", s);\n"
+        "    sqlite3_stmt *st = NULL; int n = 0;\n"
+        "    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {\n"
+        "        if (sqlite3_step(st) == SQLITE_ROW) n = sqlite3_column_int(st, 0);\n"
+        "        sqlite3_finalize(st);\n"
+        "    }\n"
+        "    return n;\n"
+        "}"
+    )
+    void_src = "void q_void(sqlite3 *db, char *s) { sqlite3_exec(db, s, 0, 0); }"
     build_src = "const char* build(char *u) { return u; }"
     assert _sql_mode(exec_src) == "exec"
     assert _sql_mode(build_src) == "build"
+    assert _returns_int(exec_src)
+    assert not _returns_int(void_src)
 
     exec_h = _sql_probe_harness(exec_src, "query", "exec")
     assert "#include <sqlite3.h>" in exec_h
-    assert "probe_t" in exec_h and "COUNT=" in exec_h
+    assert "probe_t" in exec_h and "ROWS=" in exec_h
+    # 双行基准：隐藏行使布尔绕过可把可见行从 1 提升到 2
+    assert "SQLPROBE_SECRET" in exec_h
+    # 返回 void 形态无法回传行数，harness 标记 ROWS=NA，判据降级
+    void_h = _sql_probe_harness(void_src, "q_void", "exec")
+    assert "ROWS=NA" in void_h
+    # exec 调用按形参感知：sqlite3* 传 db，首个 char* 传载荷
+    exec_call = _sql_exec_probe_call("query", ["sqlite3 *db", "char *s"])
+    assert "query(db," in exec_call
+    assert "' OR '1'='1" in exec_call
     build_h = _sql_probe_harness(build_src, "build", "build")
     assert "SQL>" in build_h
 
@@ -124,9 +149,10 @@ def t_sql_probe_logic() -> None:
     # SQL build：拼接结果带出载荷片段即复现
     assert _sql_reproduced("SQL>SELECT * FROM t WHERE x=' OR '1'='1' -- ", "build")
     assert not _sql_reproduced("SQL>SELECT * FROM t WHERE x='a'", "build")
-    # SQL exec：行数 >1 复现；基准 1 行不复现
-    assert _sql_reproduced("COUNT=3", "exec")
-    assert not _sql_reproduced("COUNT=1", "exec")
+    # SQL exec：回传行数 >1 复现；基准 1 行 / NA 不可观测不复现
+    assert _sql_reproduced("ROWS=3", "exec")
+    assert not _sql_reproduced("ROWS=1", "exec")
+    assert not _sql_reproduced("ROWS=NA", "exec")
 
 
 # 5) 注入探针降级：开关关闭 / 非 78,89 / SQL 探针在无工具链或缺 sqlite3 库时 uncertain
