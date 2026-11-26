@@ -82,7 +82,8 @@ RUN_TIMEOUT = float(os.environ.get("DYNCHECK_TIMEOUT", "5"))
 #: 单条 finding 全部种子的运行总预算秒数（逐进程跑，防止极端情况超时堆积）
 TOTAL_TIMEOUT = float(os.environ.get("DYNCHECK_TOTAL_TIMEOUT", "60"))
 #: 覆盖率反馈开关：开启时编译带 --coverage，按覆盖增量排序并生成邻域变异第二轮；
-#: 默认关闭，避免影响现有 ASan 路径。反馈闭环需在有工具链的环境调通。
+#: 默认关闭，避免影响现有 ASan 路径。覆盖导出/行级解析/增量排序已在本机 clang
+#: 便携工具链实测打通；Linux/Docker 口径下的大样本增量排序待环境就绪复核。
 COVERAGE_ENABLED = os.environ.get("DYNCHECK_COVERAGE", "0") not in ("0", "false", "False")
 #: 变异输入轮数上限（AutoSafeCoder 跑 150 轮；单 finding 静态先行，这里取小值控成本）
 MAX_ITERATIONS = int(os.environ.get("DYNCHECK_MAX_ITER", "24"))
@@ -590,7 +591,7 @@ def _collect_dep_sources(
 
 
 # ---------------------------------------------------------------------------
-# 覆盖率反馈（框架；真实闭环需在有工具链的环境调通）
+# 覆盖率反馈（框架；导出/解析/排序链路已在本机 clang 实测打通）
 # ---------------------------------------------------------------------------
 def _coverage_flags() -> List[str]:
     """覆盖率编译/链接选项；开关关闭时返回空列表。"""
@@ -618,8 +619,8 @@ def _parse_gcov_lines(text: str) -> frozenset:
 def _read_line_coverage(workdir: str) -> Optional[frozenset]:
     """读取 workdir 下 ``.gcov`` 文本产物汇总行级覆盖；无文本产物返回 None。
 
-    说明：gcc 带 ``--coverage`` 运行后先产出 ``.gcda``，需再跑一次 ``gcov`` /
-    ``llvm-cov`` 导出 ``.gcov`` 文本；该触发步骤依赖工具链，当前环境未验证，
+    说明：gcc/clang 带 ``--coverage`` 运行后产出 ``.gcda/.gcno``，再由 ``gcov`` /
+    ``llvm-cov`` 导出 ``.gcov`` 文本；本机 clang 工具链已实测该导出链路可用，
     此处只负责读已有文本。
     """
     covered: set = set()
@@ -704,8 +705,8 @@ def _export_gcov(workdir: str, compiler: Optional[str], use_docker: bool) -> Non
 def _coverage_signature(workdir: str) -> Optional[frozenset]:
     """汇总覆盖签名：优先行级覆盖行号集合；无 .gcov 文本时回退 .gcda 粗签名。
 
-    无任何覆盖产物返回 None，种子排序退回原序。行级解析逻辑可离线用样例
-    gcov 文本验证；真实 .gcov 产物的生成与增量排序需在有工具链的环境调通。
+    无任何覆盖产物返回 None，种子排序退回原序。行级解析已离线用样例 gcov
+    文本验证；本机 clang 工具链已实测真实 .gcov 产物生成与签名读取。
     """
     line_cov = _read_line_coverage(workdir)
     if line_cov is not None:
@@ -1139,7 +1140,7 @@ def dynamic_check(
                 crash_idx, crash_call, crash_blob = i, call, blob
                 break
 
-        # 第二轮：覆盖率引导邻域变异（仅开启覆盖反馈时；真实闭环待工具链环境验证）
+        # 第二轮：覆盖率引导邻域变异（仅开启覆盖反馈时；链路已在本机 clang 实测打通）
         if crash_idx is None and COVERAGE_ENABLED:
             _export_gcov(workdir, compiler, use_docker)
             ordered, _gains = _rank_by_coverage(calls, signatures)
