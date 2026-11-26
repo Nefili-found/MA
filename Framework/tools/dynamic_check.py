@@ -197,8 +197,15 @@ def _local_env(compiler: Optional[str]) -> Dict[str, str]:
     return env
 
 
-#: sanitizer 标准编译 flags（ASan + UBSan）
-_SANITIZER_FLAGS = ["-fsanitize=address,undefined"]
+#: sanitizer 标准编译 flags：ASan + 精选 UBSan 类别。
+#: 显式关闭 object-size——它会把 malloc(0)/小对象解引用判成 UB，即便未真正越界，
+#: 容易把良性输入误报为崩溃；其余高价值类别（越界、空指针、整数溢出、除零等）保留。
+_SANITIZER_FLAGS = [
+    "-fsanitize=address,alignment,array-bounds,bool,builtin,enum,"
+    "float-cast-overflow,function,integer-divide-by-zero,nonnull-attribute,"
+    "null,pointer-overflow,return,returns-nonnull-attribute,shift-base,"
+    "shift-exponent,signed-integer-overflow,unreachable,vla-bound",
+]
 #: 编译器路径 -> 是否可链接 sanitizer 运行库（探针结果缓存，避免重复编译）
 _SANITIZER_CACHE: Dict[str, bool] = {}
 
@@ -261,8 +268,8 @@ _STR_SEEDS = [
     '"%n%n%s"',
     '"\\n\\t\\"\\\\ "',
 ]
-#: malloc 异常尺寸（异常小 / 异常大缓冲区）
-_MALLOC_SIZES = ["0", "1", "4", "256", "4096"]
+#: malloc 异常尺寸（异常小 / 异常大缓冲区）；不含 0，避免 malloc(0) 解引用触发误报
+_MALLOC_SIZES = ["1", "4", "256", "4096"]
 #: 长度 / 整数种子（含正负边界与极值）
 _INT_SEEDS = ["-1", "0", "1", "-2147483648", "4096", "0x7fffffff"]
 

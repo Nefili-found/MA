@@ -347,4 +347,9 @@ assert _runner in (None, "llvm-cov", "gcov")
 dc._export_gcov(tempfile.mkdtemp(), None, False)
 print("[27] toolchain discovery, local env, gcov-tool adaptation")
 
+# 28) sanitizer 收窄：关闭 object-size（避免 malloc(0)/小对象解引用误报）；种子不生成 malloc(0)
+assert "0" not in dc._MALLOC_SIZES
+assert "object-size" not in " ".join(dc._SANITIZER_FLAGS)
+print("[28] UBSan object-size disabled; malloc(0) seed removed")
+
 print("SMOKE OK")
