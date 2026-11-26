@@ -95,6 +95,8 @@ try:
 except ValueError:
     _SEED = abs(hash(_SEED_RAW))
 _RNG = random.Random(_SEED)
+#: 第二轮覆盖引导：对排序靠前的前 K 个种子做邻域变异生成候选
+NEIGHBOR_TOP_K = int(os.environ.get("DYNCHECK_NEIGHBOR_TOP_K", "2"))
 
 # ---------------------------------------------------------------------------
 # Docker 沙箱模式
@@ -136,7 +138,23 @@ _CRASH_MARKS = (
     "double-free",
     "attempting free on address",
     "runtime error:",  # UBSan
+    "Segmentation fault",  # Linux SIGSEGV shell 文案
+    "segmentation violation",
+    "access violation",  # Windows 访问违例
 )
+
+
+def _is_crash(rc: int, blob: str, sanitizer_on: bool) -> bool:
+    """判定一次运行是否构成有罪崩溃证据。
+
+    * blob 命中 sanitizer / 内存错误标记 → 崩；
+    * sanitizer 在位（ASan/UBSan，或 Docker 镜像内齐全工具链）→ 非零退出码亦可采信；
+    * 退化普通编译（本地工具链缺 sanitizer 运行库）→ 仅凭退出码不足为据，
+      必须有明确崩溃标记，避免把普通异常退出误报为内存漏洞。
+    """
+    if any(mk in blob for mk in _CRASH_MARKS):
+        return True
+    return sanitizer_on and rc != 0
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +177,49 @@ def _toolchain() -> Optional[str]:
         if path:
             return path
     return None
+
+
+#: sanitizer 标准编译 flags（ASan + UBSan）
+_SANITIZER_FLAGS = ["-fsanitize=address,undefined"]
+#: 编译器路径 -> 是否可链接 sanitizer 运行库（探针结果缓存，避免重复编译）
+_SANITIZER_CACHE: Dict[str, bool] = {}
+
+
+def _sanitizer_flags(compiler: Optional[str], use_docker: bool) -> List[str]:
+    """返回本轮编译使用的 sanitizer flags。
+
+    * Docker 模式默认带 ASan/UBSan（容器内工具链通常齐全）；
+    * 本地模式先用最小探针试链 ``-fsanitize=address,undefined``：链接成功
+      才带 sanitizer；部分 MinGW 构建未带 sanitizer 运行库（``-lasan`` 找不到），
+      此时退化为普通编译，仅靠退出码 / SEGV 判定崩溃，不阻塞 harness 编译。
+
+    探测结果按编译器路径缓存；探针编译失败按"不可用"处理。
+    """
+    if use_docker:
+        return list(_SANITIZER_FLAGS)
+    if not compiler:
+        return []
+    cached = _SANITIZER_CACHE.get(compiler)
+    if cached is not None:
+        return list(_SANITIZER_FLAGS) if cached else []
+    probe_dir = tempfile.mkdtemp(prefix="dynprobe_")
+    try:
+        probe_c = os.path.join(probe_dir, "probe.c")
+        probe_bin = os.path.join(probe_dir, "probe.bin")
+        with open(probe_c, "w", encoding="utf-8") as fh:
+            fh.write("int main(void){return 0;}\n")
+        cp = subprocess.run(
+            [compiler, "-g", "-O1", *_SANITIZER_FLAGS, probe_c, "-o", probe_bin],
+            capture_output=True, text=True, timeout=30,
+        )
+        ok = cp.returncode == 0
+        _SANITIZER_CACHE[compiler] = ok
+        return list(_SANITIZER_FLAGS) if ok else []
+    except Exception:
+        _SANITIZER_CACHE[compiler] = False
+        return []
+    finally:
+        shutil.rmtree(probe_dir, ignore_errors=True)
 
 
 def _split_params(params: str) -> List[str]:
@@ -466,6 +527,30 @@ def _read_line_coverage(workdir: str) -> Optional[frozenset]:
         except OSError:
             continue
     return frozenset(covered) if found else None
+
+
+def _export_gcov(workdir: str, compiler: Optional[str], use_docker: bool) -> None:
+    """本地模式用 gcov 把 ``.gcda`` 导出为 ``.gcov`` 文本，供行级覆盖解析读取。
+
+    失败静默：覆盖签名回退 ``.gcda`` 粗签名或 None，不阻塞主流程。
+    docker 模式暂不在此导出（容器内由镜像侧处理）。
+    """
+    if use_docker:
+        return
+    gcov: Optional[str] = None
+    if compiler:
+        cand = os.path.join(os.path.dirname(compiler), "gcov")
+        if os.path.exists(cand):
+            gcov = cand
+    if gcov is None:
+        gcov = shutil.which("gcov")
+    if not gcov:
+        return
+    try:
+        subprocess.run([gcov, "harness.c"], cwd=workdir,
+                       capture_output=True, text=True, timeout=30)
+    except Exception:
+        return
 
 
 def _coverage_signature(workdir: str) -> Optional[frozenset]:
@@ -776,6 +861,9 @@ def dynamic_check(
     workdir = tempfile.mkdtemp(prefix="dyncheck_")
     harness_path = os.path.join(workdir, "harness.c")
     bin_path = os.path.join(workdir, "harness.bin")
+    # 探测本地工具链是否带 sanitizer 运行库；缺失时退化普通编译（仅退出码/SEGV 判定）
+    san_flags = _sanitizer_flags(compiler, use_docker)
+    san_status = "address,undefined" if san_flags else "none:runtime missing"
     try:
         with open(harness_path, "w", encoding="utf-8") as f:
             f.write(_harness(type_defs, dep_srcs, func_src, calls))
@@ -788,10 +876,10 @@ def dynamic_check(
                 cmd = ["docker", "run", "--rm", "--network=none",
                        "-v", f"{mount}:/work", "-w", "/work",
                        DOCKER_IMAGE, "gcc", "-g", "-O1", *cov,
-                       "-fsanitize=address,undefined", "harness.c", "-o", "harness.bin"]
+                       *san_flags, "harness.c", "-o", "harness.bin"]
             else:
                 cmd = [compiler, "-g", "-O1", *cov,
-                       "-fsanitize=address,undefined", harness_path, "-o", bin_path]
+                       *san_flags, harness_path, "-o", bin_path]
             cp = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
             return cp.returncode, (cp.stderr or "")
 
@@ -810,8 +898,12 @@ def dynamic_check(
                                 timeout=RUN_TIMEOUT + 10)
             return rp.returncode, (rp.stderr or "") + (rp.stdout or "")
 
-        def _replay_single(call: str) -> bool:
-            """重放单条调用是否仍崩溃；编译/运行失败一律按未复现处理（False）。"""
+        def _run_single_call(call: str) -> Tuple[bool, str]:
+            """编译并运行单条调用；返回 ``(是否崩溃, 输出 blob)``。
+
+            编译/运行异常一律按未崩溃处理（False, ""）。供崩溃最小化重放与
+            覆盖率引导第二轮候选复用。
+            """
             replay_dir = tempfile.mkdtemp(prefix="dynreplay_")
             try:
                 rp = os.path.join(replay_dir, "r.c")
@@ -823,26 +915,30 @@ def dynamic_check(
                     c_compile = ["docker", "run", "--rm", "--network=none",
                                  "-v", f"{mount}:/work", "-w", "/work",
                                  DOCKER_IMAGE, "gcc", "-g", "-O1",
-                                 "-fsanitize=address,undefined", "r.c", "-o", "r.bin"]
+                                 *san_flags, "r.c", "-o", "r.bin"]
                     c_run = ["docker", "run", "--rm", "--network=none",
                              "--memory=256m", "--pids-limit=32",
                              "-v", f"{mount}:/work", "-w", "/work",
                              DOCKER_IMAGE, "./r.bin", "0"]
                 else:
                     c_compile = [compiler, "-g", "-O1",
-                                 "-fsanitize=address,undefined", rp, "-o", rb]
+                                 *san_flags, rp, "-o", rb]
                     c_run = [rb, "0"]
                 cp = subprocess.run(c_compile, capture_output=True, text=True, timeout=60)
                 if cp.returncode != 0:
-                    return False
+                    return False, ""
                 rp_run = subprocess.run(c_run, capture_output=True, text=True,
                                         timeout=RUN_TIMEOUT + 10)
                 blob = (rp_run.stderr or "") + (rp_run.stdout or "")
-                return rp_run.returncode != 0 or any(mk in blob for mk in _CRASH_MARKS)
+                return _is_crash(rp_run.returncode, blob, bool(san_flags)), blob
             except Exception:
-                return False
+                return False, ""
             finally:
                 shutil.rmtree(replay_dir, ignore_errors=True)
+
+        def _replay_single(call: str) -> bool:
+            """重放单条调用是否仍崩溃；编译/运行失败一律按未复现处理（False）。"""
+            return _run_single_call(call)[0]
 
         rc, stderr = _compile()
         if rc != 0:
@@ -861,6 +957,7 @@ def dynamic_check(
         crash_blob = ""
         seeds_ran = 0
         timeouts = 0
+        second_round: List[str] = []
         signatures: Dict[int, Optional[frozenset]] = {}
         for i, call in enumerate(calls):
             if time.monotonic() >= deadline:
@@ -876,10 +973,32 @@ def dynamic_check(
                 continue
             seeds_ran += 1
             signatures[i] = _coverage_signature(workdir)
-            if rc != 0 or any(mark in blob for mark in _CRASH_MARKS):
+            if _is_crash(rc, blob, bool(san_flags)):
                 crash_mark = next((mk for mk in _CRASH_MARKS if mk in blob), "crash")
                 crash_idx, crash_call, crash_blob = i, call, blob
                 break
+
+        # 第二轮：覆盖率引导邻域变异（仅开启覆盖反馈时；真实闭环待工具链环境验证）
+        if crash_idx is None and COVERAGE_ENABLED:
+            _export_gcov(workdir, compiler, use_docker)
+            ordered, _gains = _rank_by_coverage(calls, signatures)
+            seen2: set = set(calls)
+            for seed in ordered[:NEIGHBOR_TOP_K]:
+                for variant in _neighbor_mutate(seed):
+                    if variant not in seen2:
+                        seen2.add(variant)
+                        second_round.append(variant)
+            for j, s_call in enumerate(second_round):
+                if time.monotonic() >= deadline:
+                    break
+                crashed, s_blob = _run_single_call(s_call)
+                seeds_ran += 1
+                if crashed:
+                    crash_mark = next((mk for mk in _CRASH_MARKS if mk in s_blob),
+                                      "crash")
+                    crash_idx = len(calls) + j
+                    crash_call, crash_blob = s_call, s_blob
+                    break
 
         if crash_idx is not None:
             min_call, min_record = _minimize_call(crash_call, replay=_replay_single)
@@ -901,12 +1020,14 @@ def dynamic_check(
                     "minimization": min_record,
                     "seed_index": crash_idx,
                     "seed_count": len(calls),
+                    "second_round_seeds": len(second_round),
                     "seeds_ran": seeds_ran,
                     "timeouts": timeouts,
                     "coverage_enabled": COVERAGE_ENABLED,
                     "dependency_functions": dep_names,
                     "dependency_source": dep_source,
                     "type_definition_count": len(type_defs),
+                    "sanitizer": san_status,
                     "sanitizer_log_tail": crash_blob[-800:],
                     "backend": f"docker:{DOCKER_IMAGE}" if use_docker else str(compiler),
                 },
@@ -917,12 +1038,17 @@ def dynamic_check(
 
         # 全部跑通（或预算耗尽）：fuzz 未覆盖到 ≠ 无漏洞
         final_outcome = OUTCOME_TIMEOUT if timeouts > 0 else OUTCOME_SAFE
+        extra = max(0, seeds_ran - len(calls))
+        scope = (f"（首轮 {len(calls)} 种子 + {extra} 变异候选）"
+                 if extra > 0 else f"/{len(calls)}")
         return _skip(
-            f"{seeds_ran}/{len(calls)} 个种子未触发运行时错误（未覆盖 ≠ 安全）",
+            f"{seeds_ran} 次运行{scope}未触发运行时错误（未覆盖 ≠ 安全）",
             finding_id,
             outcome=final_outcome,
             iterations=seeds_ran,
             seed_count=len(calls),
+            second_round_seeds=len(second_round),
+            seeds_ran=seeds_ran,
             timeouts=timeouts,
         )
     except subprocess.TimeoutExpired:

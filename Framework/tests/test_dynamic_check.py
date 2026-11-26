@@ -8,11 +8,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import tools.dynamic_check as dc
 from tools.dynamic_check import (
     CONF_DYNAMIC_CRASH,
     MAX_ITERATIONS,
+    NEIGHBOR_TOP_K,
     OUTCOME_DISABLED,
     OUTCOME_NOT_APPLICABLE,
+    OUTCOME_SAFE,
     OUTCOME_TOOLCHAIN_MISSING,
     dynamic_check,
     _extract_function,
@@ -24,9 +27,15 @@ from tools.dynamic_check import (
     _minimize_call,
     _parse_gcov_lines,
     _read_line_coverage,
+    _export_gcov,
+    _coverage_signature,
+    _rank_by_coverage,
+    _neighbor_mutate,
+    _is_crash,
     _FUNC_RE,
     _NUMERIC_RE,
     _STRING_LITERAL_RE,
+    _sanitizer_flags,
     _toolchain,
 )
 
@@ -70,8 +79,15 @@ assert r3["verdict"] != "reject"
 
 
 def _exec_available() -> bool:
-    """本机/容器是否具备编译执行条件（gcc/clang 或 docker）。"""
-    return _toolchain() is not None or shutil.which("docker") is not None
+    """是否具备"真正复现崩溃"的条件：docker 容器，或本地编译器可链接 sanitizer。
+
+    仅存在 gcc 但工具链未带 ASan/UBSan 运行库（部分 MinGW 构建）时，小范围
+    栈/堆越界不触发 SEGV，正向崩溃用例继续 SKIP，不在此环境断言 accept。
+    """
+    if shutil.which("docker") is not None:
+        return True
+    compiler = _toolchain()
+    return compiler is not None and bool(_sanitizer_flags(compiler, False))
 
 
 # 6) 应用层开关 enabled=False → 直接跳过，不探测工具链、不触发编译/运行
@@ -81,10 +97,10 @@ print("[6] disabled:", r_off["verdict"], "|", r_off["reason"])
 assert r_off["verdict"] == "uncertain" and r_off["confidence"] == 0.0
 assert "已关闭" in r_off["reason"]
 
-# 7) 正向崩溃复现：有 gcc/clang/docker 时，越界样本应被 ASan/运行时错误抓住 → accept 0.92；
-#    无执行环境时跳过本用例（不在本机实跑编译-运行路径）。
+# 7) 正向崩溃复现：有 docker 或本地编译器可链接 sanitizer 时，越界样本应被
+#    ASan/运行时错误抓住 → accept 0.92；缺执行环境 / 缺 sanitizer 运行库时跳过。
 if not _exec_available():
-    print("[7] SKIP: 未找到 gcc/clang/docker，正向崩溃用例不在本机执行")
+    print("[7] SKIP: 未找到可链接 ASan/UBSan 的编译器或 docker，正向崩溃用例不在本机执行")
 else:
     r_crash = dynamic_check(
         {"finding_id": "f-005", "cwe": "CWE-120",
@@ -153,8 +169,10 @@ print("[12] seed index mapping: %d seeds → seed_i + case i" % len(calls2))
 assert r_off["outcome"] == OUTCOME_DISABLED, r_off["outcome"]
 assert r_off["evidence"]["outcome"] == OUTCOME_DISABLED
 assert r2["outcome"] == OUTCOME_NOT_APPLICABLE, r2["outcome"]
-assert r["outcome"] == OUTCOME_TOOLCHAIN_MISSING, r["outcome"]
-assert r["evidence"]["outcome"] == OUTCOME_TOOLCHAIN_MISSING
+# 无编译器/docker → toolchain_missing；有编译器（即便缺 sanitizer 运行库，
+# 退化普通编译）跑通未崩 → safe。两种环境都绝不 reject。
+assert r["outcome"] in (OUTCOME_TOOLCHAIN_MISSING, OUTCOME_SAFE), r["outcome"]
+assert r["evidence"]["outcome"] == r["outcome"]
 # 未崩 / 降级结果绝不 reject，且带超时计数档（离线无超时，记 0）
 assert r["evidence"].get("timeouts") == 0
 print("[13] outcome labels:", r_off["outcome"], "/", r2["outcome"], "/", r["outcome"])
@@ -226,5 +244,42 @@ with tempfile.TemporaryDirectory() as td:
     cov2 = _read_line_coverage(td)
     assert cov2 == {1, 2, 4}
 print("[19] line coverage readback:", sorted(cov2))
+
+# 20) 第二轮闭环·导出降级：空目录无 gcov 产物时导出不抛异常，签名回退 None
+with tempfile.TemporaryDirectory() as td:
+    _export_gcov(td, None, False)
+    assert _coverage_signature(td) is None, "空目录无覆盖产物应返回 None"
+print("[20] gcov export degrades silently; empty dir signature -> None")
+
+# 21) 第二轮闭环·覆盖增量排序：新增覆盖多的种子排前（临时开启覆盖反馈）
+old_cov = dc.COVERAGE_ENABLED
+dc.COVERAGE_ENABLED = True
+try:
+    calls_rank = ["seed_a", "seed_b"]
+    sigs = {0: frozenset({1}), 1: frozenset({1, 2, 3, 4})}
+    ordered, gains = _rank_by_coverage(calls_rank, sigs)
+    assert ordered[0] == "seed_b", f"增量更大的 seed_b 应排前: {ordered}"
+    assert gains[1][0] > gains[0][0], "seed_b 新增覆盖量应大于 seed_a"
+finally:
+    dc.COVERAGE_ENABLED = old_cov
+print("[21] coverage-gain ranking: higher-gain seed first")
+
+# 22) 第二轮闭环·邻域变异候选去重：候选不含首轮原调用，且与首轮集合不相交
+sample_call = 'copy_name((char*)malloc(64), "longstringAAAA", 4096);'
+variants = _neighbor_mutate(sample_call)
+seen2 = {sample_call}
+second_round = [v for v in variants if v not in seen2]
+assert second_round, "应至少生成一个邻域变异候选"
+assert all(v != sample_call for v in second_round)
+assert NEIGHBOR_TOP_K >= 1
+print("[22] neighbor variants deduped, exclude first-round seeds; top_k =", NEIGHBOR_TOP_K)
+
+# 23) 保守崩溃判定：退化普通编译仅凭非零退出码不算崩，须有明确标记；
+#     sanitizer 在位时非零退出码可采信。
+assert not _is_crash(1, "", False), "退化环境空 blob + 非零退出码不应判崩"
+assert _is_crash(1, "Segmentation fault (core dumped)", False), "SEGV 文案在退化环境应判崩"
+assert _is_crash(1, "", True), "sanitizer 在位时非零退出码可采信"
+assert not _is_crash(0, "", True), "退出码 0 不应判崩"
+print("[23] conservative crash gate: mark-only fallback when sanitizer missing")
 
 print("SMOKE OK")
