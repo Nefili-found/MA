@@ -32,6 +32,9 @@ from tools.dynamic_check import (
     _rank_by_coverage,
     _neighbor_mutate,
     _is_crash,
+    _parse_llm_seeds,
+    _merge_seeds,
+    _llm_seeds,
     _FUNC_RE,
     _NUMERIC_RE,
     _STRING_LITERAL_RE,
@@ -281,5 +284,50 @@ assert _is_crash(1, "Segmentation fault (core dumped)", False), "SEGV 文案在�
 assert _is_crash(1, "", True), "sanitizer 在位时非零退出码可采信"
 assert not _is_crash(0, "", True), "退出码 0 不应判崩"
 print("[23] conservative crash gate: mark-only fallback when sanitizer missing")
+
+# 24) LLM 输出解析：合法语句保留，注释/围栏/非本函数调用/重复行丢弃
+LLM_RAW = """```c
+copy_name((char*)malloc(1), "x", 4096);
+// 这是注释
+other_func(1);
+copy_name((char*)malloc(1), "x", 4096);
+copy_name(NULL, NULL, -1)
+```"""
+parsed = _parse_llm_seeds(LLM_RAW, "copy_name")
+assert parsed == [
+    "copy_name((char*)malloc(1), \"x\", 4096);",
+    "copy_name(NULL, NULL, -1);",
+], parsed
+assert not any("other_func" in p for p in parsed)
+print("[24] llm seed parse: valid kept, noise/dup dropped")
+
+# 25) 种子合并：LLM 排前、去重保序、按上限截断
+merged = _merge_seeds(["L1", "L2"], ["H1", "L2"])
+assert merged == ["L1", "L2", "H1"], merged
+assert _merge_seeds(["a", "b", "c"], cap=2) == ["a", "b"]
+print("[25] seed merge: llm-first, dedup, cap")
+
+# 26) LLM 种子提供方：可用假客户端出种子；抛异常 / None 客户端回退空列表
+class _FakeResp:
+    def __init__(self, content):
+        self.content = content
+
+
+class _FakeLLM:
+    def __init__(self, content=None, exc=None):
+        self.content, self.exc = content, exc
+
+    def invoke(self, prompt):
+        if self.exc:
+            raise self.exc
+        return _FakeResp(self.content)
+
+
+good = _llm_seeds(_FakeLLM('copy_name((char*)malloc(1), "x", 4096);'),
+                  "copy_name", ["char*", "const char*", "int"], "src", "120")
+assert good == ["copy_name((char*)malloc(1), \"x\", 4096);"], good
+assert _llm_seeds(_FakeLLM(exc=RuntimeError("boom")), "copy_name", [], "src", "120") == []
+assert _llm_seeds(None, "copy_name", [], "src", "120") == []
+print("[26] llm provider: seeds on success, empty fallback on error/None")
 
 print("SMOKE OK")

@@ -345,6 +345,93 @@ def _gen_calls(func_name: str, params: List[str]) -> List[str]:
     return uniq[:MAX_ITERATIONS]
 
 
+# ---------------------------------------------------------------------------
+# LLM 种子提供方（C 档骨架）：有可用 LLM 时由模型定向生成调用种子；
+# 无 Key / 导入失败 / 调用异常 / 返回不可解析时一律回退启发式种子，不阻塞主流程。
+# ---------------------------------------------------------------------------
+_LLM_SEED_PROMPT = """你是 C 语言模糊测试种子生成器。下面是一个待验证的 C 函数（CWE {cwe}）。
+请给出最多 {n} 条调用该函数的 C 语句，优先构造可能触发缓冲区越界、空指针、
+释放后使用或长度不一致的参数组合。只输出调用语句，每行一条；不要解释、
+不要代码块围栏，指针参数用 (char*)malloc 或字符串字面量。
+
+函数名：{func}
+参数：{params}
+源码：
+{src}
+"""
+
+
+def _parse_llm_seeds(text: str, func_name: str) -> List[str]:
+    """解析 LLM 输出为合法调用语句；注释 / 围栏 / 非本函数调用行丢弃。"""
+    out: List[str] = []
+    seen: set = set()
+    prefix = f"{func_name}("
+    for raw in text.splitlines():
+        line = raw.strip().strip("`").strip()
+        if not line or line.startswith("//") or line.startswith("#"):
+            continue
+        if line.startswith("```"):
+            continue
+        line = line.rstrip(";").strip()
+        if line.endswith(")"):
+            stmt = line + ";"
+        else:
+            stmt = line + ");"
+        if not stmt.startswith(prefix) or stmt in seen:
+            continue
+        seen.add(stmt)
+        out.append(stmt)
+    return out
+
+
+def _llm_seeds(
+    llm: Any,
+    func_name: str,
+    params: List[str],
+    func_src: str,
+    cwe: str,
+) -> List[str]:
+    """调用 LLM 生成定向种子；任何失败 / 空结果返回空列表，交启发式兜底。"""
+    if llm is None:
+        return []
+    try:
+        prompt = _LLM_SEED_PROMPT.format(
+            cwe=cwe or "?", func=func_name,
+            params=", ".join(params) or "(无)", src=func_src,
+            n=MAX_ITERATIONS,
+        )
+        resp = llm.invoke(prompt)
+        content = getattr(resp, "content", None)
+        if content is None:
+            content = str(resp)
+        return _parse_llm_seeds(str(content), func_name)
+    except Exception as exc:
+        log_event("dynamic_check.llm_seed_failed", level="warn",
+                  function=func_name, error=f"{type(exc).__name__}: {exc}")
+        return []
+
+
+def _merge_seeds(*groups: List[str], cap: int = MAX_ITERATIONS) -> List[str]:
+    """合并多组种子，去重保序，按上限截断控成本。"""
+    seen: set = set()
+    out: List[str] = []
+    for group in groups:
+        for c in group:
+            if c and c not in seen:
+                seen.add(c)
+                out.append(c)
+    return out[:cap]
+
+
+def _default_llm() -> Optional[Any]:
+    """懒加载框架 LLM 客户端；无 Key / 导入失败 / 构造失败返回 None。"""
+    try:
+        from agents.llm_client import get_llm
+        return get_llm()
+    except Exception:
+        return None
+
+
 def _extract_function(code: str, func_name: str) -> Optional[str]:
     """从源码里粗提取被测函数文本（括号配平截取）。"""
     idx = code.find(func_name)
@@ -790,6 +877,7 @@ def dynamic_check(
     hypothesis: Dict[str, Any],
     context: Dict[str, Any],
     enabled: Optional[bool] = None,
+    llm: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """对一条 finding 做动态验证，返回与 verify_taint 同构的结果。
 
@@ -797,6 +885,8 @@ def dynamic_check(
     :param context:    ``{file, line_range, code}``
     :param enabled:    应用层开关；``None`` 时回退模块级 ``ENABLED``（环境变量
                        ``DYNCHECK_ENABLED``），显式 ``False`` 直接跳过，不触发编译/运行。
+    :param llm:        可选 LLM 客户端；``None`` 时懒加载框架默认客户端，无可用
+                       凭证则纯启发式种子。LLM 定向种子排在启发式之前，去重合并。
 
     判出口径：
 
@@ -848,7 +938,13 @@ def dynamic_check(
     if not m:
         return _skip(f"未能解析 {func_name} 的签名", finding_id,
                      outcome=OUTCOME_WEAK_INPUT)
-    calls = _gen_calls(func_name, _split_params(m.group("params")))
+    params = _split_params(m.group("params"))
+    effective_llm = llm if llm is not None else _default_llm()
+    llm_seeds = _llm_seeds(effective_llm, func_name, params, func_src,
+                            _norm_cwe(hypothesis))
+    heuristic = _gen_calls(func_name, params)
+    calls = _merge_seeds(llm_seeds, heuristic)
+    seed_source = "llm+heuristic" if llm_seeds else "heuristic"
     if not calls:
         return _skip(f"{func_name} 参数形态无法生成种子", finding_id,
                      outcome=OUTCOME_WEAK_INPUT)
@@ -1021,6 +1117,7 @@ def dynamic_check(
                     "seed_index": crash_idx,
                     "seed_count": len(calls),
                     "second_round_seeds": len(second_round),
+                    "seed_source": seed_source,
                     "seeds_ran": seeds_ran,
                     "timeouts": timeouts,
                     "coverage_enabled": COVERAGE_ENABLED,
@@ -1048,6 +1145,7 @@ def dynamic_check(
             iterations=seeds_ran,
             seed_count=len(calls),
             second_round_seeds=len(second_round),
+            seed_source=seed_source,
             seeds_ran=seeds_ran,
             timeouts=timeouts,
         )
