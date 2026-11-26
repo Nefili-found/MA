@@ -212,6 +212,30 @@ START ──┼─> B ─┼─> D ─> END
 
 ---
 
+## 数据集准备（本地管理，不入库）
+
+原始数据集与抽取产物均被 `.gitignore` 忽略，本地管理、不随代码上传；仓库内仅
+`examples/input/sample.c` 占位样例（5 条良性片段，不可独立编译）。
+
+### 检测端：PrimeVul 测试用例
+
+- 原始三 split `.jsonl`（test / valid / train）放到 `test_data/primevul_raw/`。
+- 生成索引：`python test_data/extract_cases.py --limit N`（目录 / 产物 / 状态路径见脚本
+  `--help`）；split 优先级 test → valid → train；仅保留完整函数、行数 20–150，超长不截断。
+- 产物：`test_data/test_cases.jsonl`（字段 `id / func / label / cwe / line_count / source`），
+  脚本内置 validate 校验 JSON 可解析、字段齐全、行数区间一致。
+
+### 修复端：APPATCH held-out 评测集
+
+- 两评测集解压到 `other fix framework/datasets/`：
+  - `extractfix_dataset/`：平铺 `*_vul.c` / `*_nonvul.c`（24 对）；
+  - `zeroday_repair/`：每目录 `vul.c` / `nonvul.c`（97 对）。
+- 先自检：`python test_data/build_repair_eval_cases.py --check`；通过后去掉 `--check` 写盘。
+- 产物：`test_data/repair_eval_cases.jsonl`（只存文件指针、sha256 与行号记账，不复制源码），
+  供 `repair/intake.py` 与 `tools/run_detection_cases.py` 消费。
+
+---
+
 ## 验收标准
 
 提供一组示例数据集后，项目能够完整跑通即可（不校验漏洞判断是否正确）。
