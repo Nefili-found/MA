@@ -386,7 +386,14 @@ def injection_runtime(
         result = _compile_and_run(compiler, harness, extra_libs)
         if result["stage"] == "compile":
             log_event("injection_runtime.compile_failed", finding_id=finding_id)
-            hint = "（SQL 探针可能缺 sqlite3 开发库，需在装 libsqlite3-dev 的 Linux/WSL 口径链接）" if cwe == "89" else ""
+            tail = (result.get("compile_tail") or "").lower()
+            if cwe == "89":
+                if "sqlite3" in tail and ("undefined" in tail or "unresolved" in tail or "sqlite3.h" in tail):
+                    hint = "（sqlite3 头文件/链接缺失：需在 Linux/WSL 安装 libsqlite3-dev 后以 -lsqlite3 链接；Windows 便携工具链未携带该开发库）"
+                else:
+                    hint = "（SQL 探针需 -lsqlite3；缺开发库时请在 Linux/WSL 安装 libsqlite3-dev）"
+            else:
+                hint = ""
             return _skip(f"探针 harness 编译/链接失败{hint}", finding_id,
                          probe_type=probe_type, mode=mode,
                          compile_stderr_tail=result["compile_tail"])

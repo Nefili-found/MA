@@ -71,3 +71,9 @@ D 层现有两条验证路径：
 - 未在 D 层编排中接入第三路信号；
 - 未标定符号 / 污点证据的置信度档位；
 - 未做引擎结果与现有 `verify_taint` / `dynamic_check` 证据的冲突合并规则。
+
+## 7. 环境决策记录（本轮评估）
+
+- **当前阶段不默认启用真实引擎**：候选 angr 为 Python 重依赖（claripy / z3 / archinfo / pyvex / unicorn 等），加载慢，原生绑定在 Windows 原生环境支持有限；符号执行还存在路径爆炸风险。本交付链路以静态启发式 + 动态执行为主，符号 / 污点保持接口预留，工厂返回 `unavailable`。
+- **后续接入环境**：建议在 WSL2 / Docker Linux 口径安装引擎，隔离于主链路；必须设定路径步数、求解超时与内存上限，后端不可用即降级 `unavailable`，不阻断 A/B/C 编排。
+- **接入顺序**：实现后端类 → `register_backend` 注册 → 工厂取用 → 作为第三路信号并入 `combine` → 单独标定置信度档位 → 与现有 `verify_taint` / `dynamic_check` 证据做冲突合并。

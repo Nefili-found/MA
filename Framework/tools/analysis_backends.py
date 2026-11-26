@@ -11,6 +11,24 @@
 * ``dynamic_check`` —— 编译运行 + Sanitizer 崩溃监控（动态执行）；
 * 符号执行 / DTaint（本模块预留）—— 路径约束求解 / 污点传播追踪，
   用于补静态可达性判断与动态样本覆盖不到的路径。
+
+## 如何插拔真实后端（后续阶段，不在默认链路启用）
+
+实现对应抽象类 → 调用 :func:`register_backend` 注册 → 工厂取用：
+
+.. code-block:: python
+
+    class AngrSymbolic(SymbolicAnalyzer):
+        name = "angr"
+
+        def analyze(self, func_src, params, sinks, context):
+            # 约束求解，返回 AnalysisResult；不可用 / 证据不足时返回 unknown，不判无罪
+            return {"status": "unknown", "findings": [], "evidence": {}}
+
+    register_backend("symbolic", "angr", AngrSymbolic)
+    backend = get_symbolic_backend("angr")
+
+未注册任何后端前，工厂一律返回 :class:`_UnavailableBackend`，结果状态 ``unavailable``。
 """
 from __future__ import annotations
 
