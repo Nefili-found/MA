@@ -27,18 +27,21 @@ verify:
   drop_rejected: true       # overturn 的 finding 是否从最终输出剔除（false = 只打标不丢）
   # 动态验证（第二阶段，AutoSafeCoder 式 fuzzing 证据）：只对内存类 CWE、
   # 沙箱内 gcc/clang 执行、只产出"有罪证据"（崩溃=accept 0.92），永不判 reject。
-  # 未装编译器时自动跳过；以下行为由环境变量控制（无需改代码）：
+  # 运行前提：Linux/WSL 口径装有 gcc 或 clang；无编译器时自动降级为 uncertain。
+  # 以下行为由环境变量控制（无需改代码）：
   #   DYNCHECK_ENABLED=0  全局关闭    DYNCHECK_MAX_ITER=24  变异轮数
   #   DYNCHECK_TIMEOUT=5  单进程超时秒数
   dynamic:
     enabled: true
     note: "无 gcc/clang 时自动降级；生产环境建议挂 Docker 镜像运行"
-  # 注入类源码核验（78 命令注入 / 89 SQL 注入 / 79 XSS）：
-  # 源码层核验 sink 命中 + 外部输入直达 + 有无参数化/转义/白名单；
-  # 静态证据 accept 0.88，永不判 reject。开关由环境变量控制：INJCHECK_ENABLED=0 关闭。
+  # 注入类核验分两层：
+  # * 静态核验（injection_check，accept 0.88）：sink 命中 + 外部输入直达 + 有无参数化/转义/白名单；
+  # * 运行时探针（injection_runtime，accept 0.90，默认关闭 INJRUNTIME_ENABLED=0）：命令 canary
+  #   回显 + sqlite3 SQL 拼接/绕过观测；SQL 探针需 -lsqlite3（Linux/WSL 装 libsqlite3-dev）。
+  # XSS（79）需浏览器渲染，不在动态复现范围。
   injection:
     enabled: true
-    note: "静态源码特征核验；真实执行复现需 shell/DB/浏览器环境，后续按需扩展"
+    note: "静态源码核验 + 可选运行时探针；探针须在隔离沙箱显式开启"
 
 logging:
   enabled: true

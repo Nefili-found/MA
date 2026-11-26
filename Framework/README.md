@@ -29,7 +29,11 @@ project/
     view.py                   # view 表读写（工具调用与推断）
     retrieval.py              # 会话内历史相似漏洞检索
   tools/
-    verify_taint.py           # 污点验证工具接口（默认 uncertain，留白）
+    dynamic_check.py          # 内存类 CWE 动态执行验证：编译 harness + ASan/UBSan 崩溃复现/定位/最小化/覆盖引导
+    injection_runtime.py      # 命令/SQL 注入运行时探针：canary 回显 + sqlite3 拼接/绕过观测
+    injection_check.py        # 注入类静态源码核验（sink 命中 / 输入直达 / 参数化）
+    verify_taint.py           # 污点假设核验：触发路径可达性 + 守卫/条件 blocker 三重作用域
+    analysis_backends.py      # 符号执行 / 动态污点后端抽象接口（未接真实引擎时返回 unavailable）
     call_context.py           # 单文件调用上下文工具（tree-sitter-cpp：callers / callees / body）
   prompts/
     roles.yaml                # A/B/C 角色 Prompt（已填写；留空时用内置占位）
@@ -54,8 +58,20 @@ project/
 ### 1. 基础环境
 
 - **Python 3.11+**
-- **Linux** 环境（开发/运行目标环境）
+- **Linux / WSL2** 环境（动态编译运行的目标口径；Windows 便携 clang 仅作辅助验证）
 - 无需 GPU；无需向量数据库
+
+### 1b. 动态验证工具链（可选，按需安装）
+
+动态验证链路在缺工具链时会自动降级为 `uncertain`，不阻塞主流程；要真正跑出崩溃/注入证据，需具备：
+
+| 用途 | 系统依赖 | 说明 |
+| --- | --- | --- |
+| 内存崩溃复现（ASan/UBSan） | gcc 或 clang（带 sanitizer 运行库） | 探测顺序：`DYNCHECK_CC` 显式路径 → PATH 中 clang → gcc |
+| SQL 注入运行时探针 | `libsqlite3-dev`（SQLite 开发头与 `-lsqlite3`） | Ubuntu/WSL：`sudo apt install libsqlite3-dev` |
+| 命令注入探针 | 目标 shell（sh/cmd 均可） | 探针载荷为固定 canary，不接真实外部输入 |
+
+> 运行时探针默认关闭（`INJRUNTIME_ENABLED=0`）；仅在可信隔离沙箱内显式开启。
 
 ### 2. 安装依赖
 
@@ -202,11 +218,55 @@ START ──┼─> B ─┼─> D ─> END
 
 ---
 
+## 动态验证链路（D 阶段）
+
+### 证据口径（不变量）
+
+- **只产出有罪证据，永不判 reject**：探针/复现成功 → accept；未复现、编译失败、无工具链、超时、预算耗尽一律记 `uncertain`；**未覆盖 ≠ 安全**。
+- 合并阈值 τ = 0.8；仅命中启发式 blocker 时置信度封顶 0.55，单凭启发式不能单独推翻 finding。
+
+### 置信度档位
+
+| 证据类型 | 工具 | 置信度 | 证据字段 |
+| --- | --- | --- | --- |
+| 内存崩溃复现 | `dynamic_check` | 0.92 | `evidence.dynamic` |
+| 注入运行时探针复现 | `injection_runtime` | 0.90 | `evidence.injection_runtime` |
+| 注入静态源码核验 | `injection_check` | 0.88 | `evidence.injection` |
+| 路径/条件核验通过 | `verify_taint` | 0.90 | `evidence.conditions / blockers` |
+
+### 已闭环能力（双口径实测：Windows 便携 clang / WSL2 Ubuntu）
+
+- **内存类动态执行**：同文件依赖闭包补齐 → 角色感知变异种子 → 分种子独立进程定位崩溃种子 → ASan/UBSan 检出越界/越界写 → 崩溃输入二分最小化 → 覆盖反馈邻域变异第二轮。
+- **命令注入探针（CWE-78）**：首个 `char*` 传 canary 载荷，观测命令回显。
+- **SQL 注入探针（CWE-89）**：build 型观测载荷是否进入拼接结果；exec 型读取被测函数回传的命中行数（`ROWS`），布尔绕过可见行从 1 升到 2 才复现；参数化安全样例不误报。
+
+### 成熟度分级
+
+| 层级 | 模块 | 状态 |
+| --- | --- | --- |
+| 已实测闭环 | `dynamic_check` 崩溃链路、命令探针、SQL build/exec 探针 | 双口径编译运行跑通，离线断言覆盖 |
+| 静态启发式核验 | `verify_taint` 路径可达 + blocker 三重作用域 | 离线断言覆盖，不执行二进制 |
+| 接口预留 | `analysis_backends` 符号执行 / 动态污点 | **未接真实引擎**，工厂返回 `unavailable`，不产出结论 |
+| 已知边界 | 见下节「已知限制」 | 不阻塞主链路交付 |
+
+### 相关开关
+
+| 变量 / 配置 | 作用 |
+| --- | --- |
+| `VERIFY_DYNAMIC_ENABLED` | 应用层动态验证总开关（优先级高于进程级变量） |
+| `VERIFY_INJECTION_ENABLED` | 应用层注入核验总开关 |
+| `DYNCHECK_ENABLED` / `DYNCHECK_MAX_ITER` / `DYNCHECK_TIMEOUT` / `DYNCHECK_TOTAL_TIMEOUT` | 动态进程级兜底：开关、变异轮数、单进程/总预算超时 |
+| `DYNCHECK_COVERAGE` | 1=开启覆盖反馈与邻域变异第二轮 |
+| `DYNCHECK_CC` | 显式指定 C 编译器全路径；缺省按 PATH 探测 clang→gcc |
+| `INJRUNTIME_ENABLED` | 注入运行时探针开关，默认关闭；须在隔离沙箱显式开启 |
+
+---
+
 ## 需要你后续补充的内容
 
 见 [QUESTION.md](QUESTION.md)。主要包括：
 
-- 具体污点验证工具实现（`tools/verify_taint.py`）
+- 接入真实符号执行 / 动态污点引擎（`analysis_backends` 已预留抽象接口与注册机制）
 - API Key / 环境变量填写（`config/.env`）
 - 报告内容字段的生成逻辑
 
@@ -236,6 +296,40 @@ START ──┼─> B ─┼─> D ─> END
 
 ---
 
+## 已知限制
+
+- **符号执行 / 动态污点未接真实引擎**：`analysis_backends` 仅提供抽象接口与注册机制，未注册后端时结果为 `unavailable`，不产出有罪/无罪结论。
+- **拦截器覆盖差异**：`strcmp` 读越界在当前工具链下可能漏报；`strlen`、`memcpy` 源端越界可被 ASan 检出。
+- **检测端数据集规模**：目前仅提取小样例；修复端评测集（121 条）已就绪。
+- **知识库检索降级**：未安装 faiss-cpu / sentence-transformers / torch / numpy 时，embed 退化为哈希 ngram、索引退化为 flat-python，与动态验证链路无关。
+- **既有测试失败归因**：`test_kb_*` 缺训练数据集文件、`test_pipeline_assumptions` 缺可选编排依赖 langgraph；均与动态验证链路无关，不影响其离线断言。
+
+## 测试入口
+
+动态 / 注入 / 信号 / 工具循环相关离线断言：
+
+```bash
+# 脚本式裸断言（直接运行，末尾打印 SMOKE / OK）
+python tests/test_dynamic_check.py
+python tests/test_p2_framework.py
+
+# pytest 全量收集（KB 数据集相关用例在缺数据时会跳过 / 降级，属已知限制）
+python -m pytest tests/ -q
+```
+
+| 测试文件 | 覆盖范围 |
+| --- | --- |
+| `test_dynamic_check.py` | 动态链路：种子生成、依赖闭包、崩溃定位、最小化、覆盖排序、UBSan 收窄 |
+| `test_p2_framework.py` | 覆盖率排序、邻域变异、最小化、命令/SQL 探针分流与复现解析、占位后端 |
+| `test_signal_plugins.py` | 信号合并与探针/崩溃提权接入 |
+| `test_verify_signals.py` | 裁决过滤与证据落报告 |
+| `test_tool_loop_runtime.py` | 工具绑定、开关过滤与探针分发 |
+| `test_injection_check.py` | 注入静态核验分流与降级 |
+| `test_slice_location.py` | 源码位置切片 |
+
+---
+
 ## 验收标准
 
-提供一组示例数据集后，项目能够完整跑通即可（不校验漏洞判断是否正确）。
+编排链路在无 LLM 凭证时以降级模式完整跑通（A/B/C 空报告骨架 → D 去重裁决 → 落库 → 输出）；
+动态验证链路在具备 gcc/clang（SQL 探针另需 sqlite3 开发库）的 Linux/WSL 口径下，可对内存类与注入类 finding 复现并产出带置信度的有罪证据。未覆盖到的路径不判定为安全。
