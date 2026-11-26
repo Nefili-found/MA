@@ -330,4 +330,21 @@ assert _llm_seeds(_FakeLLM(exc=RuntimeError("boom")), "copy_name", [], "src", "1
 assert _llm_seeds(None, "copy_name", [], "src", "120") == []
 print("[26] llm provider: seeds on success, empty fallback on error/None")
 
+# 27) 工具链发现 / 本地环境 / 覆盖工具适配（离线，不触发真实编译链接）
+import os as _os
+_fake_cc = _os.path.abspath(__file__)  # 存在的文件，仅用于命中 DYNCHECK_CC 分支
+_os.environ["DYNCHECK_CC"] = _fake_cc
+assert dc._toolchain() == _fake_cc, "DYNCHECK_CC 显式路径应优先返回"
+_os.environ.pop("DYNCHECK_CC", None)
+
+_env = dc._local_env(r"C:\fake\llvm-mingw\bin\clang.exe")
+assert _env["PATH"].startswith(r"C:\fake\llvm-mingw\bin" + _os.pathsep)
+assert "PATH" in dc._local_env(None)
+
+_tool, _runner = dc._find_gcov_tool(None)
+assert _runner in (None, "llvm-cov", "gcov")
+# 无工具 / 空目录时导出静默返回，不抛异常、不阻塞主流程
+dc._export_gcov(tempfile.mkdtemp(), None, False)
+print("[27] toolchain discovery, local env, gcov-tool adaptation")
+
 print("SMOKE OK")

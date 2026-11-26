@@ -171,12 +171,30 @@ def _is_memory_cwe(hypothesis: Dict[str, Any]) -> bool:
 
 
 def _toolchain() -> Optional[str]:
-    """探测可用 C 工具链；返回编译器路径，都没有则 None。"""
-    for exe in ("gcc", "clang"):
+    """探测可用 C 工具链；返回编译器路径，都没有则 None。
+
+    优先级：``DYNCHECK_CC`` 显式路径 → PATH 中的 clang → gcc。
+    clang 优先：MinGW 版 gcc 通常不带 sanitizer 运行库，clang/LLVM-MinGW 才
+    能链接 ASan/UBSan。
+    """
+    cc_env = os.environ.get("DYNCHECK_CC", "").strip()
+    if cc_env and os.path.exists(cc_env):
+        return cc_env
+    for exe in ("clang", "gcc"):
         path = shutil.which(exe)
         if path:
             return path
     return None
+
+
+def _local_env(compiler: Optional[str]) -> Dict[str, str]:
+    """本地子进程环境：PATH 前置编译器 bin 目录，确保 ASan/UBSan 动态运行库可加载。"""
+    env = dict(os.environ)
+    if compiler:
+        bin_dir = os.path.dirname(compiler)
+        if bin_dir:
+            env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
+    return env
 
 
 #: sanitizer 标准编译 flags（ASan + UBSan）
@@ -616,25 +634,61 @@ def _read_line_coverage(workdir: str) -> Optional[frozenset]:
     return frozenset(covered) if found else None
 
 
+def _find_gcov_tool(compiler: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """定位 gcov 兼容覆盖导出工具。
+
+    :return: ``(工具路径, 调用形态)``；形态为 ``"llvm-cov"``（需 ``gcov`` 子命令）
+        或 ``"gcov"``（裸命令）；都找不到返回 ``(None, None)``。
+    """
+    candidates = []
+    if compiler:
+        bdir = os.path.dirname(compiler)
+        candidates += [
+            (os.path.join(bdir, "llvm-cov.exe"), "llvm-cov"),
+            (os.path.join(bdir, "llvm-cov"), "llvm-cov"),
+            (os.path.join(bdir, "gcov.exe"), "gcov"),
+            (os.path.join(bdir, "gcov"), "gcov"),
+        ]
+    for exe, runner in (("llvm-cov.exe", "llvm-cov"), ("llvm-cov", "llvm-cov"),
+                        ("gcov.exe", "gcov"), ("gcov", "gcov")):
+        candidates.append((shutil.which(exe) or "", runner))
+    for cand, runner in candidates:
+        if cand and os.path.exists(cand):
+            return cand, runner
+    return None, None
+
+
 def _export_gcov(workdir: str, compiler: Optional[str], use_docker: bool) -> None:
-    """本地模式用 gcov 把 ``.gcda`` 导出为 ``.gcov`` 文本，供行级覆盖解析读取。
+    """本地模式用 gcov / llvm-cov 把 ``.gcda`` 导出为 ``.gcov`` 文本，供行级覆盖解析读取。
 
     失败静默：覆盖签名回退 ``.gcda`` 粗签名或 None，不阻塞主流程。
     docker 模式暂不在此导出（容器内由镜像侧处理）。
     """
     if use_docker:
         return
-    gcov: Optional[str] = None
-    if compiler:
-        cand = os.path.join(os.path.dirname(compiler), "gcov")
-        if os.path.exists(cand):
-            gcov = cand
-    if gcov is None:
-        gcov = shutil.which("gcov")
-    if not gcov:
+    tool, runner = _find_gcov_tool(compiler)
+    if not tool:
         return
+    # GCOV 产物名可能带可执行前缀（``<bin>-<src>.gcno/.gcda``），而 gcov 工具
+    # 默认按 ``<src>.gcno/.gcda`` 查找；复制为标准名兜底。
+    std_names = {".gcno": "harness.gcno", ".gcda": "harness.gcda"}
     try:
-        subprocess.run([gcov, "harness.c"], cwd=workdir,
+        names = os.listdir(workdir)
+    except OSError:
+        return
+    for ext, std in std_names.items():
+        if std in names:
+            continue
+        pre = next((n for n in names if n.endswith(ext)), None)
+        if pre:
+            try:
+                shutil.copyfile(os.path.join(workdir, pre),
+                                os.path.join(workdir, std))
+            except OSError:
+                pass
+    try:
+        cmd = [tool, "gcov", "harness.c"] if runner == "llvm-cov" else [tool, "harness.c"]
+        subprocess.run(cmd, cwd=workdir,
                        capture_output=True, text=True, timeout=30)
     except Exception:
         return
@@ -976,7 +1030,8 @@ def dynamic_check(
             else:
                 cmd = [compiler, "-g", "-O1", *cov,
                        *san_flags, harness_path, "-o", bin_path]
-            cp = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            cp = subprocess.run(cmd, capture_output=True, text=True, timeout=120,
+                                env=None if use_docker else _local_env(compiler))
             return cp.returncode, (cp.stderr or "")
 
         def _run(idx: int) -> Tuple[int, str]:
@@ -991,7 +1046,8 @@ def dynamic_check(
             else:
                 cmd = [bin_path, seed_arg]
             rp = subprocess.run(cmd, capture_output=True, text=True,
-                                timeout=RUN_TIMEOUT + 10)
+                                timeout=RUN_TIMEOUT + 10,
+                                env=None if use_docker else _local_env(compiler))
             return rp.returncode, (rp.stderr or "") + (rp.stdout or "")
 
         def _run_single_call(call: str) -> Tuple[bool, str]:
@@ -1020,11 +1076,13 @@ def dynamic_check(
                     c_compile = [compiler, "-g", "-O1",
                                  *san_flags, rp, "-o", rb]
                     c_run = [rb, "0"]
-                cp = subprocess.run(c_compile, capture_output=True, text=True, timeout=60)
+                cp = subprocess.run(c_compile, capture_output=True, text=True, timeout=60,
+                                    env=None if use_docker else _local_env(compiler))
                 if cp.returncode != 0:
                     return False, ""
                 rp_run = subprocess.run(c_run, capture_output=True, text=True,
-                                        timeout=RUN_TIMEOUT + 10)
+                                        timeout=RUN_TIMEOUT + 10,
+                                        env=None if use_docker else _local_env(compiler))
                 blob = (rp_run.stderr or "") + (rp_run.stdout or "")
                 return _is_crash(rp_run.returncode, blob, bool(san_flags)), blob
             except Exception:
