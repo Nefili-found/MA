@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 from typing import Any, Dict, List, Optional
 
@@ -49,15 +50,31 @@ def deduplicate(
     session_id: str,
     conn: Any,
     llm: Optional[Any],
+    preserve_paths: bool = False,
 ) -> List[Dict[str, Any]]:
-    """语义去重 + 合并贡献 + 会话内相似历史检索。"""
+    """语义去重 + 合并贡献 + 会话内相似历史检索。
+
+    ``preserve_paths=True``（默认关）开启路径安全分组：只合并同位置/同源汇/同路径/
+    同条件的候选，并保留每条候选的原始 finding_id 与路径条件组合；关系不明的
+    路径分开验证，仅在报告展示层聚合。
+    """
     if not findings:
         return []
 
-    groups = group_indices(findings, llm)
+    groups = path_safe_groups(findings) if preserve_paths else group_indices(findings, llm)
     merged: List[Dict[str, Any]] = []
     for group in groups:
         base = dict(findings[group[0]])
+        if preserve_paths:
+            base["_candidate_paths"] = [
+                {
+                    "finding_id": findings[idx].get("id", ""),
+                    "agent": findings[idx].get("_agent", ""),
+                    "path": deepcopy(findings[idx].get("propagation_path") or []),
+                    "assumptions": deepcopy(findings[idx].get("assumptions") or []),
+                }
+                for idx in group
+            ]
         contributions: List[Dict[str, Any]] = []
         chain: Optional[List[Any]] = None
         # 触发前提按视角并集：同一漏洞可能被 A/C 从不同角度提出不同前置条件，
@@ -105,12 +122,58 @@ def deduplicate(
 
 def group_indices(findings: List[Dict[str, Any]], llm: Optional[Any]) -> List[List[int]]:
     """分组入口：LLM 优先，异常回落启发式。"""
+    if len(findings) <= 1:
+        return [[0]] if findings else []
     if llm is not None:
         try:
             return llm_group(findings, llm)
         except Exception as exc:
             log_event("dedupe.llm_failed", level="warn", error=str(exc))
     return heuristic_group(findings)
+
+
+def path_safe_groups(findings: List[Dict[str, Any]]) -> List[List[int]]:
+    """只合并同位置、同源汇、同路径及同条件；关系不明的候选分开验证。
+
+    不按“CWE + 同函数 + 行号邻近”判同一漏洞：不同 sink 默认分开。位置/源/汇/路径/
+    条件任一缺失的候选单独成桶（键带下标），宁可多验也不误合并。
+    """
+    buckets: Dict[Any, List[int]] = {}
+    for index, finding in enumerate(findings):
+        loc = finding.get("location") or {}
+        source = finding.get("taint_source")
+        sink = finding.get("taint_sink")
+        path = finding.get("propagation_path") or []
+        conditions = [
+            ({k: v for k, v in item.items() if k != "id"} if isinstance(item, dict) else item)
+            for item in finding.get("assumptions") or []
+        ]
+        if not all(
+            (
+                loc.get("function"),
+                loc.get("line_start"),
+                source,
+                sink,
+                path,
+                finding.get("cwe"),
+            )
+        ):
+            key: Any = ("incomplete", index)
+        else:
+            key = json.dumps(
+                [
+                    finding.get("cwe"),
+                    loc,
+                    source,
+                    sink,
+                    path,
+                    sorted(json.dumps(c, sort_keys=True, ensure_ascii=False) for c in conditions),
+                ],
+                sort_keys=True,
+                ensure_ascii=False,
+            )
+        buckets.setdefault(key, []).append(index)
+    return list(buckets.values())
 
 
 def heuristic_group(findings: List[Dict[str, Any]]) -> List[List[int]]:

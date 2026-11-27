@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from observability import log_event
-from verify_agent.schema import FINAL_REPORT_TEMPLATE
+from verify_agent.schema import EVIDENCE_OPTIONAL_KEYS, FINAL_REPORT_TEMPLATE
 
 
 def build_final_report(file_path: str, verified: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -42,6 +42,10 @@ def build_final_report(file_path: str, verified: List[Dict[str, Any]]) -> Dict[s
             "blockers": ev.get("blockers") or [],
             "used_tools": ev.get("used_tools") or [],
         }
+        # 可选证据块：只在工具信号真的产生时才出键，不输出空壳
+        for _key in EVIDENCE_OPTIONAL_KEYS:
+            if ev.get(_key):
+                item["evidence"][_key] = ev[_key]
         report["findings"].append(item)
     return report
 

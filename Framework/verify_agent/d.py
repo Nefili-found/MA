@@ -125,7 +125,14 @@ def run(state: Dict[str, Any]) -> Dict[str, Any]:
             n_lines = len(str(code).splitlines())
             findings = [_normalize_slice_location(f, slice_start, n_lines) for f in findings]
         with track_time("dedupe"):
-            merged = _deduplicate(findings, session_id, conn, llm)
+            if bool(getattr(settings, "verify_preserve_candidate_paths", False)):
+                # 【路径安全去重】先按语法树校正位置，再只合同位/同源汇/同路径的候选；
+                # 每条候选的原始 finding_id 与条件组合随证据带出（默认关 = 现行为）。
+                call_ctx = set_active_context(code)
+                findings = [_resolve_location(f, call_ctx, code) for f in findings]
+                merged = _deduplicate(findings, session_id, conn, llm, preserve_paths=True)
+            else:
+                merged = _deduplicate(findings, session_id, conn, llm)
 
         # 4) 冲突裁决 + 置信度
         with track_time("adjudicate"):

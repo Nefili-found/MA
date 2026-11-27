@@ -26,6 +26,7 @@ from tools.injection_check import injection_check, injection_check_tool
 from tools.injection_runtime import injection_runtime, injection_runtime_tool
 from tools.verify_taint import verify_taint, verify_taint_tool
 from verify_agent.prompts import load_verify_prompts
+from verify_agent.execution import execute
 from verify_agent.signals import parse_llm_verdict
 
 
@@ -74,14 +75,14 @@ def build_model_payload(
 
 
 def available_tools(
-    dynamic_enabled: bool = True,
-    injection_enabled: bool = True,
+    dynamic_enabled: bool = False,
+    injection_enabled: bool = False,
+    injection_runtime_enabled: bool = False,
 ) -> List[Any]:
     """可绑定的工具集合：verify_taint + dynamic_check + 注入核验/探针 + 上下文工具（缺失的自动跳过）。
 
-    动态 / 注入工具受配置开关控制；关闭时不绑定，LLM 侧也就不会发起对应调用。
-    注入探针 ``injection_runtime`` 复用注入总开关；模块自身 ``INJRUNTIME_ENABLED``
-    作为第二道兜底（默认关闭）。
+    三路插件各自独立开关（默认全关 = 现行为）；关闭时不绑定，LLM 侧也就不会
+    发起对应调用。静态核验与运行探针分开控制，不再共用一个总开关。
     """
     tools: List[Any] = []
     if verify_taint_tool is not None:
@@ -90,7 +91,7 @@ def available_tools(
         tools.append(dynamic_check_tool)
     if injection_enabled and injection_check_tool is not None:
         tools.append(injection_check_tool)
-    if injection_enabled and injection_runtime_tool is not None:
+    if injection_runtime_enabled and injection_runtime_tool is not None:
         tools.append(injection_runtime_tool)
     tools.extend(t for t in CONTEXT_TOOLS if t is not None)
     return tools
@@ -101,8 +102,11 @@ def dispatch_tool(
     args: Dict[str, Any],
     hypothesis: Dict[str, Any],
     context: Dict[str, Any],
-    dyn_on: bool = True,
-    inj_on: bool = True,
+    dyn_on: bool = False,
+    inj_on: bool = False,
+    runtime_on: bool = False,
+    execution: Any = None,
+    settings: Any = None,
 ) -> Any:
     """按工具名分发，返回 ``(result, call_record)``。
 
@@ -110,18 +114,26 @@ def dispatch_tool(
     * 上下文工具：内部已降级，额外再兜一层 try/except，绝不中断主流程。
 
     :param dyn_on: 应用层动态执行开关，透传给 ``dynamic_check`` 的 ``enabled``；
-    :param inj_on: 应用层注入核验/探针开关，透传给两个注入工具的 ``enabled``。
+    :param inj_on: 应用层注入源码核验开关；
+    :param runtime_on: 应用层注入运行探针开关（与静态核验独立）；
         开关关闭时工具本就不绑定到 LLM；此处为兜底直连路径补齐同一道开关，
         避免绕过绑定层后回退到工具模块级环境变量。
+    :param execution: 可选的 ``ExecutionSession``；传入时相同输入的同会话调用复用
+        已冻结结果（不改变实际参与计算的输入）。
     """
     args = args or {}
+    if settings is not None:
+        # 兼容传 settings 的调用方：三路开关以配置为准
+        dyn_on = bool(getattr(settings, "verify_dynamic_enabled", dyn_on))
+        inj_on = bool(getattr(settings, "verify_injection_enabled", inj_on))
+        runtime_on = bool(getattr(settings, "verify_injection_runtime_enabled", runtime_on))
     # 兼容 LangChain 暴露的 *_tool 命名（verify_taint_tool / get_callers_tool 等）
     if name and name.endswith("_tool"):
         name = name[: -len("_tool")]
     if name == "verify_taint":
         h = args.get("hypothesis", hypothesis)
         c = args.get("context", context)
-        result = verify_taint(h, c)
+        result = execute(execution, "verify_taint", verify_taint, h, c)
         # 只记紧凑标识：完整 hypothesis/context 已分别落 hypothesis_json，避免冗余与循环引用
         finding_id = h.get("finding_id", "") if isinstance(h, dict) else ""
         return result, {"tool": "verify_taint", "args": {"finding_id": finding_id}}
@@ -129,21 +141,22 @@ def dispatch_tool(
     if name == "dynamic_check":
         h = args.get("hypothesis", hypothesis)
         c = args.get("context", context)
-        result = dynamic_check(h, c, enabled=dyn_on)
+        result = execute(execution, "dynamic_check", dynamic_check, h, c, enabled=dyn_on)
         finding_id = h.get("finding_id", "") if isinstance(h, dict) else ""
         return result, {"tool": "dynamic_check", "args": {"finding_id": finding_id}}
 
     if name == "injection_check":
         h = args.get("hypothesis", hypothesis)
         c = args.get("context", context)
-        result = injection_check(h, c, enabled=inj_on)
+        result = execute(execution, "injection", injection_check, h, c, enabled=inj_on)
         finding_id = h.get("finding_id", "") if isinstance(h, dict) else ""
         return result, {"tool": "injection_check", "args": {"finding_id": finding_id}}
 
     if name == "injection_runtime":
         h = args.get("hypothesis", hypothesis)
         c = args.get("context", context)
-        result = injection_runtime(h, c, enabled=inj_on)
+        result = execute(execution, "injection_runtime", injection_runtime, h, c,
+                         enabled=runtime_on)
         finding_id = h.get("finding_id", "") if isinstance(h, dict) else ""
         return result, {"tool": "injection_runtime", "args": {"finding_id": finding_id}}
 
@@ -170,6 +183,7 @@ def invoke_verify(
     ctx: ContextManager,
     session_id: str,
     finding_idx: int,
+    execution: Any = None,
 ):
     """调用验证工具。
 
@@ -184,12 +198,14 @@ def invoke_verify(
       ``_signal_llm``）；走纯工具兜底路径时为 ``None``，表示「无 LLM 信号」——
       与「LLM 表态 uncertain」严格区分。
     """
-    dyn_on = getattr(settings, "verify_dynamic_enabled", True)
-    inj_on = getattr(settings, "verify_injection_enabled", True)
-    if llm is not None and available_tools(dyn_on, inj_on):
+    dyn_on = getattr(settings, "verify_dynamic_enabled", False)
+    inj_on = getattr(settings, "verify_injection_enabled", False)
+    runtime_on = getattr(settings, "verify_injection_runtime_enabled", False)
+    if llm is not None and available_tools(dyn_on, inj_on, runtime_on):
         try:
             call, result, reports, llm_sig = tool_loop(
-                llm, hypothesis, context, settings, ctx, session_id, finding_idx
+                llm, hypothesis, context, settings, ctx, session_id, finding_idx,
+                execution=execution,
             )
             return call, result, reports, llm_sig
         except VerifyError:
@@ -199,7 +215,7 @@ def invoke_verify(
 
     # 兜底：直接调用（无 LLM / 无工具）。这里使用完整 context，不受外存影响。
     try:
-        result = verify_taint(hypothesis, context)
+        result = execute(execution, "verify_taint", verify_taint, hypothesis, context)
     except Exception as exc:
         raise VerifyError(f"工具调用失败: {exc}") from exc
     tool_call = {"tool": "verify_taint", "args": {"hypothesis": hypothesis, "context": context}}
@@ -214,6 +230,7 @@ def tool_loop(
     ctx: ContextManager,
     session_id: str,
     finding_idx: int,
+    execution: Any = None,
 ):
     """模型自主多轮工具循环（MAVUL 式），接入 A 篇上下文治理。
 
@@ -221,11 +238,13 @@ def tool_loop(
     """
     from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
-    dyn_on = getattr(settings, "verify_dynamic_enabled", True)
-    inj_on = getattr(settings, "verify_injection_enabled", True)
+    dyn_on = getattr(settings, "verify_dynamic_enabled", False)
+    inj_on = getattr(settings, "verify_injection_enabled", False)
+    runtime_on = getattr(settings, "verify_injection_runtime_enabled", False)
     tools = available_tools(
         dynamic_enabled=dyn_on,
         injection_enabled=inj_on,
+        injection_runtime_enabled=runtime_on,
     )
     bound = llm.bind_tools(tools)
 
@@ -277,7 +296,8 @@ def tool_loop(
             args = tc.get("args", {}) or {}
             result, call_record = dispatch_tool(
                 name, args, hypothesis, context,
-                dyn_on=dyn_on, inj_on=inj_on,
+                dyn_on=dyn_on, inj_on=inj_on, runtime_on=runtime_on,
+                execution=execution,
             )
             trace.append(call_record)
             if name == "verify_taint":
@@ -307,6 +327,7 @@ def tool_loop(
             {"hypothesis": hypothesis, "context": context},
             hypothesis,
             context,
+            execution=execution,
         )
     if last_call is None:  # pragma: no cover - 防御
         last_call = {"tool": "verify_taint", "args": {}}

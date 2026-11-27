@@ -10,6 +10,11 @@ from typing import Any, Dict
 #: D 需要的上游视角；缺一即视为编排缺陷（FatalError）
 REQUIRED_AGENTS = ("A", "B", "C")
 
+#: 可选证据块：**只在工具信号真的产生该块时才出键**。缺失时宁可不输出，也不输出
+# 空壳 —— 下游会把空壳读成“判过了 = unknown”（语义污染）。
+# 动态/注入三路插件与去重候选路径都属于这一类。
+EVIDENCE_OPTIONAL_KEYS = ("dynamic", "injection", "injection_runtime", "candidate_paths")
+
 #: 最终报告结构（output/final_report.json）。
 # 核验证据已进最终报告（原先只进 view 表）：修复 Agent 需要知道“为什么判它成立/被推翻”，
 # 而不只是一个 verification_status。逐跳可达性、假设条件与阻塞守卫都在 evidence 里。

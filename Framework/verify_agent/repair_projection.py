@@ -154,6 +154,11 @@ def build_repair_input(
                     "path": evidence.get("path") or [],
                     "conditions": evidence.get("conditions") or [],
                     "blockers": evidence.get("blockers") or [],
+                    **{
+                        key: evidence[key]
+                        for key in ("dynamic", "injection", "injection_runtime")
+                        if key in evidence
+                    },
                 },
                 "provenance": {
                     "detector": "A/B/C+D",

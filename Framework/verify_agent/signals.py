@@ -21,13 +21,16 @@ from tools.dynamic_check import CONF_DYNAMIC_CRASH, dynamic_check
 from tools.injection_check import CONF_INJECTION_EVIDENCE, injection_check
 from tools.injection_runtime import CONF_INJECTION_RUNTIME, injection_runtime
 from tools.verify_taint import VERDICT_TO_STATUS, verify_taint
+from verify_agent.execution import execute
 
 
 def tool_signal(
     hypothesis: Dict[str, Any],
     context: Dict[str, Any],
-    dynamic_enabled: bool = True,
-    injection_enabled: bool = True,
+    dynamic_enabled: bool = False,
+    injection_enabled: bool = False,
+    injection_runtime_enabled: bool = False,
+    execution: Any = None,
 ) -> Dict[str, Any]:
     """工具信号：直接调用 verify_taint，不调 LLM。
 
@@ -35,10 +38,13 @@ def tool_signal(
     异常时降级为 ``uncertain``（只影响合并，不影响主流程）。
 
     :param dynamic_enabled:    关闭时不触发动态编译/运行，也不挂动态证据；
-    :param injection_enabled: 关闭时不触发注入源码核验与运行时探针。
+    :param injection_enabled: 关闭时不触发注入源码核验；
+    :param injection_runtime_enabled: 关闭时不触发注入运行探针（与静态核验分开控制）；
+    :param execution: 可选的 ``ExecutionSession``；传入时同会话同输入的调用复用已冻结
+        的结果，**不改变实际参与计算的输入，也不改变模型所见内容**。
     """
     try:
-        result = verify_taint(hypothesis, context)
+        result = execute(execution, "verify_taint", verify_taint, hypothesis, context)
     except Exception as exc:  # 纯工具信号不拖垮整图
         log_event("verify.tool_signal_failed", level="warn", error=f"{type(exc).__name__}: {exc}")
         return {
@@ -69,7 +75,8 @@ def tool_signal(
     # * 跳过 / 未崩 → 只附证据，不改判（没崩 ≠ 没漏洞，绝不 reject）。
     if dynamic_enabled:
         try:
-            dyn = dynamic_check(hypothesis, context, enabled=dynamic_enabled)
+            dyn = execute(execution, "dynamic_check", dynamic_check, hypothesis, context,
+                          enabled=True)
         except Exception as exc:  # 动态工具异常绝不影响静态信号
             log_event("verify.dynamic_signal_failed", level="warn",
                       error=f"{type(exc).__name__}: {exc}")
@@ -83,34 +90,28 @@ def tool_signal(
     # 注入类源码核验（78/89/79）：同样只补强、从不削弱。
     # * 源码命中 sink + 直达 + 无安全写法 → accept（静态证据 0.88）；
     # * 守卫存疑 / 来源不明 → 只附证据，不改判。
-    if injection_enabled:
+    # 注入类源码核验（78/89/79）与运行探针（78/89）各自独立开关：静态核验与探针
+    # 复现分别可控，禁用某一路时该路既不执行子进程也不挂证据。
+    for name, fn, confidence_value, enabled in (
+        ("injection", injection_check, CONF_INJECTION_EVIDENCE, injection_enabled),
+        ("injection_runtime", injection_runtime, CONF_INJECTION_RUNTIME,
+         injection_runtime_enabled),
+    ):
+        if not enabled:
+            continue
         try:
-            inj = injection_check(hypothesis, context, enabled=injection_enabled)
-        except Exception as exc:  # 注入工具异常绝不影响静态信号
-            log_event("verify.injection_signal_failed", level="warn",
+            result = execute(execution, name, fn, hypothesis, context, enabled=True)
+        except Exception as exc:  # 工具异常绝不影响静态信号
+            log_event(f"verify.{name}_failed", level="warn",
                       error=f"{type(exc).__name__}: {exc}")
-            inj = None
-        if isinstance(inj, dict):
-            tool_sig["evidence"]["injection"] = inj.get("evidence") or {}
-            if str(inj.get("verdict") or "") == "accept":
-                tool_sig["verdict"] = "accept"
-                tool_sig["confidence"] = max(tool_sig["confidence"], CONF_INJECTION_EVIDENCE)
-                tool_sig["reason"] += "；注入证据：" + str(inj.get("reason") or "")
-
-        # 注入运行时探针（78/89）：静态核验之后的第二路补强。模块级
-        # INJRUNTIME_ENABLED 默认关闭；探针复现才提权（0.90），未复现不削弱。
-        try:
-            rt = injection_runtime(hypothesis, context, enabled=injection_enabled)
-        except Exception as exc:  # 探针异常绝不影响静态/主信号
-            log_event("verify.injection_runtime_failed", level="warn",
-                      error=f"{type(exc).__name__}: {exc}")
-            rt = None
-        if isinstance(rt, dict):
-            tool_sig["evidence"]["injection_runtime"] = rt.get("evidence") or {}
-            if str(rt.get("verdict") or "") == "accept":
-                tool_sig["verdict"] = "accept"
-                tool_sig["confidence"] = max(tool_sig["confidence"], CONF_INJECTION_RUNTIME)
-                tool_sig["reason"] += "；注入探针证据：" + str(rt.get("reason") or "")
+            continue
+        if not isinstance(result, dict):
+            continue
+        tool_sig["evidence"][name] = result.get("evidence") or {}
+        if str(result.get("verdict") or "").lower() == "accept":
+            tool_sig["verdict"] = "accept"
+            tool_sig["confidence"] = max(tool_sig["confidence"], confidence_value)
+            tool_sig["reason"] += f"；{name} 证据：" + str(result.get("reason") or "")
     return tool_sig
 
 

@@ -72,9 +72,15 @@ class Settings:
     # 【假设条件 + 触发路径核验】双信号合并（父设计 §3.3）
     verify_tau: float = 0.8            # 工具信号单方 overturn 的置信度阈值 τ
     verify_drop_rejected: bool = True  # overturn 的 finding 是否从最终输出剔除
-    # 第二阶段核验开关：动态执行（内存类 CWE 沙箱编译运行）/ 注入类源码核验
-    verify_dynamic_enabled: bool = True
-    verify_injection_enabled: bool = True
+    # 第二阶段核验开关：动态执行（内存类 CWE 沙箱编译运行）/ 注入类源码核验 /
+    # 注入运行探针；三路各自独立、默认关闭（opt-in）：关闭时不绑定工具、不执行子进程。
+    verify_dynamic_enabled: bool = False
+    verify_injection_enabled: bool = False
+    verify_injection_runtime_enabled: bool = False
+    # 单 finding 的验证执行墙钟预算（秒）：编译/种子/运行/最小化共享同一截止时间
+    verify_execution_timeout: float = 120.0
+    # 去重时保留每条候选的原始路径与条件（默认关 = 现行为）
+    verify_preserve_candidate_paths: bool = False
 
 
 def _as_bool(value: Any) -> bool:
@@ -181,13 +187,34 @@ def load_settings(config_path: Optional[str] = None) -> Settings:
         verify_dynamic_enabled=_as_bool(
             os.getenv(
                 "VERIFY_DYNAMIC_ENABLED",
-                (verify_cfg.get("dynamic") or {}).get("enabled", True),
+                verify_cfg.get("dynamic_enabled", (verify_cfg.get("dynamic") or {}).get("enabled", False)),
             )
         ),
         verify_injection_enabled=_as_bool(
             os.getenv(
                 "VERIFY_INJECTION_ENABLED",
-                (verify_cfg.get("injection") or {}).get("enabled", True),
+                verify_cfg.get("injection_enabled", (verify_cfg.get("injection") or {}).get("enabled", False)),
+            )
+        ),
+        verify_injection_runtime_enabled=_as_bool(
+            os.getenv(
+                "VERIFY_INJECTION_RUNTIME_ENABLED",
+                verify_cfg.get(
+                    "injection_runtime_enabled",
+                    (verify_cfg.get("injection_runtime") or {}).get("enabled", False),
+                ),
+            )
+        ),
+        verify_execution_timeout=float(
+            os.getenv(
+                "VERIFY_EXECUTION_TIMEOUT",
+                verify_cfg.get("execution_timeout", 120.0),
+            )
+        ),
+        verify_preserve_candidate_paths=_as_bool(
+            os.getenv(
+                "VERIFY_PRESERVE_CANDIDATE_PATHS",
+                verify_cfg.get("preserve_candidate_paths", False),
             )
         ),
     )

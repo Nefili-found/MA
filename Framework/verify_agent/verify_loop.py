@@ -20,6 +20,7 @@ from errors import VerifyError
 from memory.view import write_verification
 from observability import log_event
 from tools.call_context import set_active_context  # noqa: F401  （兼容 d.set_active_context）
+from verify_agent.execution import ExecutionSession
 from verify_agent.location import build_hypothesis, resolve_location
 from verify_agent.signals import combine, tool_signal
 from verify_agent.tool_loop import invoke_verify
@@ -82,6 +83,10 @@ def verify_findings(
     # 预提取当前文件的调用图上下文，供本轮的上下文工具与工具信号按需查询
     call_ctx = set_active_context(code)
 
+    # 【执行复用】一份源码一个会话：同 finding 内 D 自己的工具调用与 tool_signal
+    # 共享已冻结结果，不重复编译/运行；不改变实际参与计算的输入。
+    execution = ExecutionSession(code, settings)
+
     for finding_idx, f in enumerate(merged):
         # 【修复端输入 P0】先用语法树校正 location，再构造假设。
         # 顺序不能反：verify_taint.check_assumptions 依赖 location.function 取函数体，
@@ -100,14 +105,22 @@ def verify_findings(
         tool_sig = tool_signal(
             hypothesis,
             context,
-            dynamic_enabled=getattr(settings, "verify_dynamic_enabled", True),
-            injection_enabled=getattr(settings, "verify_injection_enabled", True),
+            dynamic_enabled=getattr(settings, "verify_dynamic_enabled", False),
+            injection_enabled=getattr(settings, "verify_injection_enabled", False),
+            injection_runtime_enabled=getattr(
+                settings, "verify_injection_runtime_enabled", False
+            ),
+            execution=execution,
         )
+        # 【路径安全去重】保留每条候选的原始路径与条件（仅开启 preserve_paths 时存在）
+        if f.get("_candidate_paths") is not None:
+            tool_sig.setdefault("evidence", {})["candidate_paths"] = f["_candidate_paths"]
         # 信号 2：LLM（语义，复用 bind_tools 多轮；无 LLM 时为 None）
         # 【健壮性包 B-2】VerifyError 只隔离当前 finding：标 uncertain + 记 errors，继续下一条
         try:
             tool_call, tool_result, context_reports, llm_sig = invoke_verify(
-                hypothesis, context, llm, settings, ctx, session_id, finding_idx
+                hypothesis, context, llm, settings, ctx, session_id, finding_idx,
+                execution=execution,
             )
             if tool_result is None:
                 raise VerifyError("工具调用无结果")
